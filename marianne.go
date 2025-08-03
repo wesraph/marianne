@@ -1098,10 +1098,6 @@ func (d *Downloader) extractZipFile(filename string, outputDir string, p *tea.Pr
 	return nil
 }
 
-func (d *Downloader) downloadToFile(ctx context.Context, file *os.File) error {
-	return d.downloadToFileWithResume(ctx, file, 0)
-}
-
 func (d *Downloader) downloadToFileWithResume(ctx context.Context, file *os.File, resumeFrom int64) error {
 	// Seek to end if resuming
 	if resumeFrom > 0 {

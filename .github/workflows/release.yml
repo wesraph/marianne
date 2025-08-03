@@ -105,16 +105,16 @@ jobs:
     - name: Create checksums
       run: |
         cd artifacts
-        # Move files out of subdirectories with unique names to avoid conflicts
-        for dir in marianne-*/; do
+        # Move files out of subdirectories
+        for dir in */; do
           if [ -d "$dir" ]; then
             # Move all files from subdirectory to current directory
             find "$dir" -type f -exec mv {} . \;
             # Remove the now-empty directory
-            rmdir "$dir"
+            rmdir "$dir" 2>/dev/null || echo "Could not remove $dir"
           fi
         done
-        # Create checksums for all binary files (not directories)
+        # Create checksums for all binary files
         find . -maxdepth 1 -type f -name 'marianne-*' -exec sha256sum {} \; > checksums.txt
 
     - name: Create Release
@@ -204,16 +204,16 @@ jobs:
     - name: Prepare artifacts
       run: |
         cd artifacts
-        # Move files out of subdirectories with unique names to avoid conflicts
-        for dir in marianne-*/; do
+        # Move files out of subdirectories
+        for dir in */; do
           if [ -d "$dir" ]; then
             # Move all files from subdirectory to current directory
             find "$dir" -type f -exec mv {} . \;
             # Remove the now-empty directory
-            rmdir "$dir"
+            rmdir "$dir" 2>/dev/null || echo "Could not remove $dir"
           fi
         done
-        # Create tarball with all binary files (not directories)
+        # Create tarball with all binary files
         tar czf marianne-latest-builds.tar.gz $(find . -maxdepth 1 -type f -name 'marianne-*' ! -name '*.tar.gz')
 
     - name: Update latest release
