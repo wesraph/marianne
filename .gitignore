@@ -1,0 +1,41 @@
+# Binaries
+marianne
+*.exe
+
+# Go build artifacts
+*.o
+*.a
+*.so
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Dependency directories
+vendor/
+
+# Go workspace file
+go.work
+
+# IDE specific files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Downloaded/extracted files (for testing)
+downloads/
+output/
+*.tar
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.tar.lz4
+*.tar.zst
