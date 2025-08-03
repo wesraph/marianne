@@ -17,10 +17,33 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        goos: [linux, darwin, windows]
-        goarch: [amd64, arm64]
-        exclude:
+        include:
+          # Linux builds
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: linux
+            goarch: 386
+          - goos: linux
+            goarch: arm
+            goarm: 7
+          # macOS builds
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          # Windows builds
           - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: 386
+          - goos: windows
+            goarch: arm64
+          # FreeBSD builds
+          - goos: freebsd
+            goarch: amd64
+          - goos: freebsd
             goarch: arm64
     
     steps:
@@ -39,18 +62,29 @@ jobs:
       env:
         GOOS: ${{ matrix.goos }}
         GOARCH: ${{ matrix.goarch }}
+        GOARM: ${{ matrix.goarm }}
         CGO_ENABLED: 0
       run: |
         output_name='marianne-${{ matrix.goos }}-${{ matrix.goarch }}'
+        if [ "${{ matrix.goarm }}" != "" ]; then
+          output_name="${output_name}v${{ matrix.goarm }}"
+        fi
         if [ "${{ matrix.goos }}" = "windows" ]; then
           output_name="${output_name}.exe"
         fi
-        go build -a -ldflags '-extldflags "-static"' -o "${output_name}" .
+        
+        # Build static binary with version info
+        VERSION="${GITHUB_REF_NAME}"
+        if [[ "$VERSION" == "master" ]] || [[ "$VERSION" == "main" ]]; then
+          VERSION="dev-${GITHUB_SHA::8}"
+        fi
+        
+        go build -a -ldflags "-extldflags '-static' -s -w -X main.Version=${VERSION}" -o "${output_name}" .
         
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: marianne-${{ matrix.goos }}-${{ matrix.goarch }}
+        name: marianne-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goarm && format('v{0}', matrix.goarm) || '' }}
         path: marianne-*
 
   release:
@@ -87,29 +121,67 @@ jobs:
           artifacts/marianne-*
           artifacts/checksums.txt
         body: |
-          ## 🚀 Marianne Release
+          ## 🚀 Marianne ${{ github.ref_name }}
           
-          ### 📦 Installation
+          ### 📦 Download
           
-          Download the appropriate binary for your system and make it executable:
+          #### 🐧 Linux
+          | Architecture | Download |
+          |--------------|----------|
+          | x64 (amd64) | [marianne-linux-amd64](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/marianne-linux-amd64) |
+          | ARM64 | [marianne-linux-arm64](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/marianne-linux-arm64) |
+          | x86 (386) | [marianne-linux-386](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/marianne-linux-386) |
+          | ARMv7 | [marianne-linux-armv7](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/marianne-linux-armv7) |
           
+          #### 🍎 macOS
+          | Architecture | Download |
+          |--------------|----------|
+          | Intel (amd64) | [marianne-darwin-amd64](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/marianne-darwin-amd64) |
+          | Apple Silicon (arm64) | [marianne-darwin-arm64](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/marianne-darwin-arm64) |
+          
+          #### 🪟 Windows
+          | Architecture | Download |
+          |--------------|----------|
+          | x64 (amd64) | [marianne-windows-amd64.exe](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/marianne-windows-amd64.exe) |
+          | x86 (386) | [marianne-windows-386.exe](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/marianne-windows-386.exe) |
+          | ARM64 | [marianne-windows-arm64.exe](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/marianne-windows-arm64.exe) |
+          
+          #### 🐡 FreeBSD
+          | Architecture | Download |
+          |--------------|----------|
+          | x64 (amd64) | [marianne-freebsd-amd64](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/marianne-freebsd-amd64) |
+          | ARM64 | [marianne-freebsd-arm64](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/marianne-freebsd-arm64) |
+          
+          ### 📥 Quick Install
+          
+          #### Linux/macOS (Intel)
           ```bash
-          # Linux/macOS
-          chmod +x marianne-*
+          curl -L https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/marianne-$(uname -s | tr '[:upper:]' '[:lower:]')-amd64 -o marianne
+          chmod +x marianne
+          sudo mv marianne /usr/local/bin/
+          ```
           
-          # Move to PATH (optional)
-          sudo mv marianne-* /usr/local/bin/marianne
+          #### macOS (Apple Silicon)
+          ```bash
+          curl -L https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/marianne-darwin-arm64 -o marianne
+          chmod +x marianne
+          sudo mv marianne /usr/local/bin/
           ```
           
           ### 🔍 Verify checksums
           
           ```bash
+          curl -L https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/checksums.txt -o checksums.txt
           sha256sum -c checksums.txt
           ```
           
-          ### 📋 Changelog
+          ### 📋 What's New
           
-          See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/master/CHANGELOG.md) for details.
+          See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/CHANGELOG.md) for details.
+          
+          ### 🏗️ Build Info
+          
+          All binaries are statically linked and stripped for minimal size.
 
   # Create latest build artifacts on master push (not release)
   latest:

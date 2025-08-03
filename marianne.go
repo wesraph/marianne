@@ -30,6 +30,11 @@ const (
 	maxMemoryBuffer  = 500 * 1024 * 1024 // 500MB max memory buffer
 )
 
+var (
+	// Version is set at build time
+	Version = "dev"
+)
+
 type Downloader struct {
 	url           string
 	workers       int
@@ -883,8 +888,16 @@ func main() {
 		outputDir      = flag.String("output", "", "Output directory (creates if doesn't exist)")
 		proxyURL       = flag.String("proxy", "", "HTTP proxy URL (e.g., http://proxy:8080)")
 		bandwidthLimit = flag.String("limit", "", "Bandwidth limit (e.g., 1M, 500K, 2.5M)")
+		showVersion    = flag.Bool("version", false, "Show version and exit")
 	)
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("Marianne %s\n", Version)
+		fmt.Println("A blazing-fast parallel downloader with automatic archive extraction")
+		fmt.Println("https://github.com/wesraph/marianne")
+		os.Exit(0)
+	}
 
 	if flag.NArg() != 1 {
 		fmt.Fprintln(os.Stderr, "Usage: marianne [options] <url>")
