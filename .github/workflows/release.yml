@@ -108,10 +108,21 @@ jobs:
         # Move files out of subdirectories
         for dir in */; do
           if [ -d "$dir" ]; then
-            # Move all files from subdirectory to current directory
-            find "$dir" -type f -exec mv {} . \;
-            # Remove the now-empty directory
-            rmdir "$dir" 2>/dev/null || echo "Could not remove $dir"
+            # Move all files from subdirectory to temp names first
+            for file in "$dir"*; do
+              if [ -f "$file" ]; then
+                filename=$(basename "$file")
+                mv "$file" "./${filename}.tmp"
+              fi
+            done
+            # Remove the directory
+            rmdir "$dir"
+            # Rename temp files back to original names
+            for tmpfile in *.tmp; do
+              if [ -f "$tmpfile" ]; then
+                mv "$tmpfile" "${tmpfile%.tmp}"
+              fi
+            done
           fi
         done
         # Create checksums for all binary files
@@ -207,10 +218,21 @@ jobs:
         # Move files out of subdirectories
         for dir in */; do
           if [ -d "$dir" ]; then
-            # Move all files from subdirectory to current directory
-            find "$dir" -type f -exec mv {} . \;
-            # Remove the now-empty directory
-            rmdir "$dir" 2>/dev/null || echo "Could not remove $dir"
+            # Move all files from subdirectory to temp names first
+            for file in "$dir"*; do
+              if [ -f "$file" ]; then
+                filename=$(basename "$file")
+                mv "$file" "./${filename}.tmp"
+              fi
+            done
+            # Remove the directory
+            rmdir "$dir"
+            # Rename temp files back to original names
+            for tmpfile in *.tmp; do
+              if [ -f "$tmpfile" ]; then
+                mv "$tmpfile" "${tmpfile%.tmp}"
+              fi
+            done
           fi
         done
         # Create tarball with all binary files

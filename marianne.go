@@ -560,7 +560,7 @@ func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir str
 	// Progress reporter
 	done := make(chan struct{})
 	go func() {
-		ticker := time.NewTicker(100 * time.Millisecond)
+		ticker := time.NewTicker(500 * time.Millisecond)
 		defer ticker.Stop()
 		lastDownloaded := int64(0)
 		lastTime := time.Now()
@@ -991,7 +991,7 @@ func (d *Downloader) downloadAndExtractZip(ctx context.Context, p *tea.Program, 
 	// Progress reporter
 	done := make(chan struct{})
 	go func() {
-		ticker := time.NewTicker(100 * time.Millisecond)
+		ticker := time.NewTicker(500 * time.Millisecond)
 		defer ticker.Stop()
 		lastDownloaded := int64(0)
 		lastTime := time.Now()
