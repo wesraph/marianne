@@ -45,9 +45,11 @@ Progress: 45.2% | Downloaded: 2.3 GB/5.1 GB | Speed: 25.4 MB/s | Avg: 22.1 MB/s 
 
 ## 🆕 What's New
 
+- **Resume Support**: Resume interrupted downloads with `-resume` flag
 - **ZIP Support**: Now supports ZIP file extraction
 - **HTTP Proxy**: Connect through HTTP proxies with `-proxy` flag
 - **Bandwidth Limiting**: Control download speed with `-limit` flag
+- **State Files**: Automatic state saving for reliable resume capability
 
 ## 🔧 Installation
 
@@ -118,6 +120,9 @@ make static
 
 # Combine options
 ./marianne -output /data -workers 4 -limit 1M -proxy http://proxy:3128 https://example.com/archive.zip
+
+# Resume an interrupted download
+./marianne -resume https://example.com/large-file.zip
 ```
 
 ### Options
@@ -129,6 +134,7 @@ make static
 | `-output` | Output directory (creates if doesn't exist) | Current directory |
 | `-proxy` | HTTP proxy URL (e.g., http://proxy:8080) | None |
 | `-limit` | Bandwidth limit (e.g., 1M, 500K, 2.5M) | Unlimited |
+| `-resume` | Resume interrupted download | false |
 
 ## 🗂️ Supported Archive Formats
 
@@ -198,18 +204,45 @@ Example downloading a 5GB file on a gigabit connection:
 
 *Results may vary based on server capabilities and network conditions*
 
+## 💾 Resume Support
+
+Marianne saves download state automatically, allowing you to resume interrupted downloads:
+
+- **State files** are saved in the system temp directory
+- **Automatic validation** ensures the remote file hasn't changed
+- **ZIP downloads** can be resumed from where they left off (true byte-range resume)
+- **TAR archives** resume by re-downloading but skipping already-extracted files
+
+### How Resume Works
+
+#### For ZIP files:
+- Downloads are saved to a temporary file
+- On resume, download continues from the exact byte where it stopped
+- No bandwidth is wasted re-downloading data
+
+#### For TAR archives:
+- Due to TAR's sequential format, we can't skip to the middle
+- On resume, the download restarts but extraction skips existing files
+- This prevents file corruption and ensures consistency
+
+To resume a download, simply add the `-resume` flag:
+```bash
+./marianne -resume https://example.com/large-file.zip
+```
+
 ## 🐛 Known Issues
 
 - RAR and 7z formats are not yet supported
 - Windows support requires tar to be installed (available in Windows 10+)
-- ZIP extraction doesn't support parallel downloads (downloads entire file first)
+- TAR archive extraction cannot be resumed mid-stream (must restart extraction)
 
 ## 🗺️ Roadmap
 
 - [x] Support for ZIP archives
 - [x] HTTP proxy support
 - [x] Bandwidth limiting options
-- [ ] Resume interrupted downloads
+- [x] Resume interrupted downloads
 - [ ] Configuration file support
 - [ ] Parallel ZIP extraction
 - [ ] Support for RAR and 7z archives
+- [ ] Resume support for TAR archives

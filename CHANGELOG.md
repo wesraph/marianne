@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Resume support for interrupted downloads with `-resume` flag
+- State file system for reliable resume capability
+- Automatic validation of remote file changes (ETag/Last-Modified)
 - ZIP archive extraction support
 - HTTP proxy support via `-proxy` flag
 - Bandwidth limiting with `-limit` flag (supports K/M/G suffixes)
@@ -16,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Updated help text to include new options
 - Improved archive type detection to handle ZIP files
+- Progress reporter now saves state periodically
 
 ## [1.0.0] - 2024-01-XX
 
