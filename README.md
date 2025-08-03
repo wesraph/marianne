@@ -43,6 +43,12 @@ Progress: 45.2% | Downloaded: 2.3 GB/5.1 GB | Speed: 25.4 MB/s | Avg: 22.1 MB/s 
 ╰───────────────────────────────────────────╯
 ```
 
+## 🆕 What's New
+
+- **ZIP Support**: Now supports ZIP file extraction
+- **HTTP Proxy**: Connect through HTTP proxies with `-proxy` flag
+- **Bandwidth Limiting**: Control download speed with `-limit` flag
+
 ## 🔧 Installation
 
 ### Download Pre-built Binaries
@@ -103,6 +109,15 @@ make static
 
 # Customize workers and chunk size
 ./marianne -workers 16 -chunk 209715200 https://example.com/huge.tar.lz4
+
+# Use HTTP proxy
+./marianne -proxy http://proxy.company.com:8080 https://example.com/file.zip
+
+# Limit bandwidth to 2.5 MB/s
+./marianne -limit 2.5M https://example.com/large-file.tar.gz
+
+# Combine options
+./marianne -output /data -workers 4 -limit 1M -proxy http://proxy:3128 https://example.com/archive.zip
 ```
 
 ### Options
@@ -112,11 +127,14 @@ make static
 | `-workers` | Number of parallel download workers | 8 |
 | `-chunk` | Chunk size in bytes | 104857600 (100MB) |
 | `-output` | Output directory (creates if doesn't exist) | Current directory |
+| `-proxy` | HTTP proxy URL (e.g., http://proxy:8080) | None |
+| `-limit` | Bandwidth limit (e.g., 1M, 500K, 2.5M) | Unlimited |
 
 ## 🗂️ Supported Archive Formats
 
 The tool automatically detects and extracts the following formats:
 
+- `.zip` - ZIP archives
 - `.tar` - Uncompressed tar
 - `.tar.gz`, `.tgz` - Gzip compressed
 - `.tar.bz2`, `.tbz2`, `.tbz` - Bzip2 compressed
@@ -182,13 +200,16 @@ Example downloading a 5GB file on a gigabit connection:
 
 ## 🐛 Known Issues
 
-- ZIP, RAR, and 7z formats are not yet supported
+- RAR and 7z formats are not yet supported
 - Windows support requires tar to be installed (available in Windows 10+)
+- ZIP extraction doesn't support parallel downloads (downloads entire file first)
 
 ## 🗺️ Roadmap
 
-- [ ] Support for ZIP archives
+- [x] Support for ZIP archives
+- [x] HTTP proxy support
+- [x] Bandwidth limiting options
 - [ ] Resume interrupted downloads
 - [ ] Configuration file support
-- [ ] Bandwidth limiting options
-- [ ] HTTP proxy support
+- [ ] Parallel ZIP extraction
+- [ ] Support for RAR and 7z archives

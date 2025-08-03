@@ -1,14 +1,17 @@
 package main
 
 import (
+	"archive/zip"
 	"bufio"
 	"context"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,6 +21,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -27,25 +31,46 @@ const (
 )
 
 type Downloader struct {
-	url        string
-	workers    int
-	chunkSize  int64
-	client     *http.Client
-	totalSize  int64
-	downloaded int64
-	startTime  time.Time
-	mu         sync.Mutex
+	url           string
+	workers       int
+	chunkSize     int64
+	client        *http.Client
+	totalSize     int64
+	downloaded    int64
+	startTime     time.Time
+	rateLimiter   *rate.Limiter
+	bandwidthLimit int64
+	mu            sync.Mutex
 }
 
-func NewDownloader(url string, workers int, chunkSize int64) *Downloader {
-	return &Downloader{
+func NewDownloader(url string, workers int, chunkSize int64, proxyURL string, bandwidthLimit int64) *Downloader {
+	transport := &http.Transport{}
+	
+	// Configure proxy if provided
+	if proxyURL != "" {
+		proxy, err := neturl.Parse(proxyURL)
+		if err == nil {
+			transport.Proxy = http.ProxyURL(proxy)
+		}
+	}
+	
+	d := &Downloader{
 		url:       url,
 		workers:   workers,
 		chunkSize: chunkSize,
 		client: &http.Client{
-			Timeout: 30 * time.Second,
+			Transport: transport,
+			Timeout:   30 * time.Second,
 		},
+		bandwidthLimit: bandwidthLimit,
 	}
+	
+	// Set up rate limiter if bandwidth limit is specified
+	if bandwidthLimit > 0 {
+		d.rateLimiter = rate.NewLimiter(rate.Limit(bandwidthLimit), int(bandwidthLimit))
+	}
+	
+	return d
 }
 
 func (d *Downloader) getFileSize() error {
@@ -90,6 +115,11 @@ func (d *Downloader) downloadChunk(ctx context.Context, start, end int64, writer
 	for {
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
+			// Apply rate limiting if configured
+			if d.rateLimiter != nil {
+				d.rateLimiter.WaitN(ctx, n)
+			}
+			
 			if _, werr := writer.Write(buf[:n]); werr != nil {
 				return werr
 			}
@@ -297,29 +327,32 @@ var archiveTypes = []archiveType{
 	{[]string{".tar"}, "", ""},
 }
 
-func detectArchiveType(filename string) (string, string, error) {
+func detectArchiveType(filename string) (string, string, bool, error) {
 	lowerName := strings.ToLower(filename)
 	
+	// Check for ZIP first
+	if strings.HasSuffix(lowerName, ".zip") {
+		return "", "", true, nil
+	}
+	
+	// Check for tar-based archives
 	for _, at := range archiveTypes {
 		for _, ext := range at.extensions {
 			if strings.HasSuffix(lowerName, ext) {
-				return at.tarFlag, at.command, nil
+				return at.tarFlag, at.command, false, nil
 			}
 		}
 	}
 	
-	// Check for non-tar archives
-	if strings.HasSuffix(lowerName, ".zip") {
-		return "", "", fmt.Errorf("ZIP archives are not supported yet")
-	}
+	// Check for unsupported archives
 	if strings.HasSuffix(lowerName, ".7z") {
-		return "", "", fmt.Errorf("7z archives are not supported yet")
+		return "", "", false, fmt.Errorf("7z archives are not supported yet")
 	}
 	if strings.HasSuffix(lowerName, ".rar") {
-		return "", "", fmt.Errorf("RAR archives are not supported yet")
+		return "", "", false, fmt.Errorf("RAR archives are not supported yet")
 	}
 	
-	return "", "", fmt.Errorf("unknown archive type for file: %s", filename)
+	return "", "", false, fmt.Errorf("unknown archive type for file: %s", filename)
 }
 
 func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir string) error {
@@ -330,11 +363,24 @@ func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir str
 	d.startTime = time.Now()
 
 	// Detect archive type from URL
-	tarFlag, tarCommand, err := detectArchiveType(d.url)
+	tarFlag, tarCommand, isZip, err := detectArchiveType(d.url)
 	if err != nil {
 		return err
 	}
 
+	// Create output directory if it doesn't exist
+	if outputDir != "" {
+		if err := os.MkdirAll(outputDir, 0755); err != nil {
+			return fmt.Errorf("failed to create output directory: %w", err)
+		}
+	}
+
+	if isZip {
+		// Handle ZIP files
+		return d.downloadAndExtractZip(ctx, p, outputDir)
+	}
+
+	// Handle tar-based archives
 	// Build tar command
 	args := []string{}
 	if tarFlag != "" {
@@ -345,11 +391,7 @@ func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir str
 	}
 	args = append(args, "-xvf", "-")
 	
-	// Create output directory if it doesn't exist
 	if outputDir != "" {
-		if err := os.MkdirAll(outputDir, 0755); err != nil {
-			return fmt.Errorf("failed to create output directory: %w", err)
-		}
 		args = append(args, "-C", outputDir)
 	}
 
@@ -613,6 +655,11 @@ func (d *Downloader) downloadSingleChunk(ctx context.Context, start, end int64, 
 	for {
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
+			// Apply rate limiting if configured
+			if d.rateLimiter != nil {
+				d.rateLimiter.WaitN(ctx, n)
+			}
+			
 			data := make([]byte, n)
 			copy(data, buf[:n])
 			
@@ -645,28 +692,227 @@ func (w *appendWriter) Write(p []byte) (n int, err error) {
 	return len(p), nil
 }
 
+func parseBandwidthLimit(limit string) int64 {
+	limit = strings.TrimSpace(strings.ToUpper(limit))
+	if limit == "" {
+		return 0
+	}
+
+	multiplier := int64(1)
+	if strings.HasSuffix(limit, "K") {
+		multiplier = 1024
+		limit = limit[:len(limit)-1]
+	} else if strings.HasSuffix(limit, "M") {
+		multiplier = 1024 * 1024
+		limit = limit[:len(limit)-1]
+	} else if strings.HasSuffix(limit, "G") {
+		multiplier = 1024 * 1024 * 1024
+		limit = limit[:len(limit)-1]
+	}
+
+	value, err := strconv.ParseFloat(limit, 64)
+	if err != nil {
+		return 0
+	}
+
+	return int64(value * float64(multiplier))
+}
+
+func (d *Downloader) downloadAndExtractZip(ctx context.Context, p *tea.Program, outputDir string) error {
+	// Create a temporary file for the ZIP
+	tmpFile, err := os.CreateTemp("", "marianne-*.zip")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+	defer tmpFile.Close()
+
+	// Progress reporter
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		lastDownloaded := int64(0)
+		lastTime := time.Now()
+		
+		for {
+			select {
+			case <-ticker.C:
+				d.mu.Lock()
+				currentDownloaded := d.downloaded
+				currentTime := time.Now()
+				d.mu.Unlock()
+				
+				// Calculate speed
+				timeDiff := currentTime.Sub(lastTime).Seconds()
+				if timeDiff > 0 {
+					bytesDiff := currentDownloaded - lastDownloaded
+					speed := float64(bytesDiff) / timeDiff
+					
+					// Calculate ETA
+					remaining := d.totalSize - currentDownloaded
+					var eta time.Duration
+					if speed > 0 {
+						eta = time.Duration(float64(remaining)/speed) * time.Second
+					}
+					
+					p.Send(progressMsg{
+						downloaded: currentDownloaded,
+						total:      d.totalSize,
+						speed:      speed,
+						eta:        eta,
+					})
+					
+					lastDownloaded = currentDownloaded
+					lastTime = currentTime
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	// Download to temp file
+	if err := d.downloadToFile(ctx, tmpFile); err != nil {
+		close(done)
+		return err
+	}
+	close(done)
+
+	// Extract ZIP file
+	reader, err := zip.OpenReader(tmpFile.Name())
+	if err != nil {
+		return fmt.Errorf("failed to open zip file: %w", err)
+	}
+	defer reader.Close()
+
+	// Extract files
+	for _, file := range reader.File {
+		path := filepath.Join(outputDir, file.Name)
+		
+		// Send file extraction message
+		p.Send(fileExtractedMsg(file.Name))
+
+		if file.FileInfo().IsDir() {
+			os.MkdirAll(path, file.Mode())
+			continue
+		}
+
+		// Create directory if needed
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			return err
+		}
+
+		// Extract file
+		fileReader, err := file.Open()
+		if err != nil {
+			return err
+		}
+		defer fileReader.Close()
+
+		targetFile, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, file.Mode())
+		if err != nil {
+			return err
+		}
+		defer targetFile.Close()
+
+		_, err = io.Copy(targetFile, fileReader)
+		if err != nil {
+			return err
+		}
+	}
+
+	p.Send(downloadCompleteMsg{})
+	return nil
+}
+
+func (d *Downloader) downloadToFile(ctx context.Context, file *os.File) error {
+	// Download entire file
+	req, err := http.NewRequestWithContext(ctx, "GET", d.url, nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	// Copy with rate limiting
+	var reader io.Reader = resp.Body
+	if d.rateLimiter != nil {
+		reader = &rateLimitedReader{
+			reader:      resp.Body,
+			limiter:     d.rateLimiter,
+			ctx:         ctx,
+			downloader:  d,
+		}
+	}
+
+	_, err = io.Copy(file, reader)
+	return err
+}
+
+type rateLimitedReader struct {
+	reader     io.Reader
+	limiter    *rate.Limiter
+	ctx        context.Context
+	downloader *Downloader
+}
+
+func (r *rateLimitedReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if n > 0 {
+		r.limiter.WaitN(r.ctx, n)
+		r.downloader.mu.Lock()
+		r.downloader.downloaded += int64(n)
+		r.downloader.mu.Unlock()
+	}
+	return n, err
+}
+
 func main() {
 	var (
-		workers   = flag.Int("workers", defaultWorkers, "Number of parallel workers")
-		chunkSize = flag.Int64("chunk", defaultChunkSize, "Chunk size in bytes")
-		outputDir = flag.String("output", "", "Output directory (creates if doesn't exist)")
+		workers        = flag.Int("workers", defaultWorkers, "Number of parallel workers")
+		chunkSize      = flag.Int64("chunk", defaultChunkSize, "Chunk size in bytes")
+		outputDir      = flag.String("output", "", "Output directory (creates if doesn't exist)")
+		proxyURL       = flag.String("proxy", "", "HTTP proxy URL (e.g., http://proxy:8080)")
+		bandwidthLimit = flag.String("limit", "", "Bandwidth limit (e.g., 1M, 500K, 2.5M)")
 	)
 	flag.Parse()
 
 	if flag.NArg() != 1 {
 		fmt.Fprintln(os.Stderr, "Usage: marianne [options] <url>")
 		fmt.Fprintln(os.Stderr, "\nOptions:")
-		fmt.Fprintln(os.Stderr, "  -workers N    Number of parallel workers (default: 8)")
-		fmt.Fprintln(os.Stderr, "  -chunk N      Chunk size in bytes (default: 100MB)")
-		fmt.Fprintln(os.Stderr, "  -output DIR   Output directory (creates if doesn't exist)")
+		fmt.Fprintln(os.Stderr, "  -workers N     Number of parallel workers (default: 8)")
+		fmt.Fprintln(os.Stderr, "  -chunk N       Chunk size in bytes (default: 100MB)")
+		fmt.Fprintln(os.Stderr, "  -output DIR    Output directory (creates if doesn't exist)")
+		fmt.Fprintln(os.Stderr, "  -proxy URL     HTTP proxy URL (e.g., http://proxy:8080)")
+		fmt.Fprintln(os.Stderr, "  -limit RATE    Bandwidth limit (e.g., 1M, 500K, 2.5M)")
 		fmt.Fprintln(os.Stderr, "\nSupported archive formats:")
-		fmt.Fprintln(os.Stderr, "  .tar, .tar.gz, .tgz, .tar.bz2, .tbz2, .tar.xz, .txz")
+		fmt.Fprintln(os.Stderr, "  .zip, .tar, .tar.gz, .tgz, .tar.bz2, .tbz2, .tar.xz, .txz")
 		fmt.Fprintln(os.Stderr, "  .tar.lz4, .tar.zst, .tar.zstd, .tar.lzma, .tar.Z")
 		os.Exit(1)
 	}
 
 	url := flag.Arg(0)
-	downloader := NewDownloader(url, *workers, *chunkSize)
+	
+	// Parse bandwidth limit
+	var limitBytes int64
+	if *bandwidthLimit != "" {
+		limitBytes = parseBandwidthLimit(*bandwidthLimit)
+		if limitBytes <= 0 {
+			fmt.Fprintf(os.Stderr, "Invalid bandwidth limit: %s\n", *bandwidthLimit)
+			os.Exit(1)
+		}
+	}
+	
+	downloader := NewDownloader(url, *workers, *chunkSize, *proxyURL, limitBytes)
 
 	// Get file size first
 	if err := downloader.getFileSize(); err != nil {

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- ZIP archive extraction support
+- HTTP proxy support via `-proxy` flag
+- Bandwidth limiting with `-limit` flag (supports K/M/G suffixes)
+- Rate-limited reader for controlled download speeds
+
+### Changed
+- Updated help text to include new options
+- Improved archive type detection to handle ZIP files
+
 ## [1.0.0] - 2024-01-XX
 
 ### Added
