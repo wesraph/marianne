@@ -27,6 +27,14 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// Retry configuration
+const (
+	defaultMaxRetries     = 10          // Maximum number of retry attempts
+	defaultInitialDelay   = 1 * time.Second  // Initial retry delay
+	defaultMaxDelay       = 30 * time.Second // Maximum retry delay
+	defaultBackoffFactor  = 2.0         // Exponential backoff multiplier
+)
+
 const (
 	defaultWorkers   = 8                  // Balanced worker count
 	defaultChunkSize = 2 * 1024 * 1024    // 2MB chunks for better granularity
@@ -77,10 +85,14 @@ type Downloader struct {
 	stateFile      string
 	state          *DownloadState
 	verbose        bool
+	maxRetries     int
+	initialDelay   time.Duration
+	maxDelay       time.Duration
+	backoffFactor  float64
 	mu             sync.Mutex
 }
 
-func NewDownloader(url string, workers int, chunkSize int64, proxyURL string, bandwidthLimit int64, verbose bool) *Downloader {
+func NewDownloader(url string, workers int, chunkSize int64, proxyURL string, bandwidthLimit int64, verbose bool, maxRetries int, retryDelay time.Duration) *Downloader {
 	transport := &http.Transport{
 		MaxIdleConns:        1000,
 		MaxIdleConnsPerHost: 1000,
@@ -110,6 +122,10 @@ func NewDownloader(url string, workers int, chunkSize int64, proxyURL string, ba
 		},
 		bandwidthLimit: bandwidthLimit,
 		verbose:        verbose,
+		maxRetries:     maxRetries,
+		initialDelay:   retryDelay,
+		maxDelay:       defaultMaxDelay,
+		backoffFactor:  defaultBackoffFactor,
 	}
 
 	// Set up rate limiter if bandwidth limit is specified
@@ -120,20 +136,90 @@ func NewDownloader(url string, workers int, chunkSize int64, proxyURL string, ba
 	return d
 }
 
+// retryWithBackoff executes a function with exponential backoff retry logic
+func (d *Downloader) retryWithBackoff(ctx context.Context, operation string, fn func() error) error {
+	var lastErr error
+	delay := d.initialDelay
+	
+	for attempt := 0; attempt <= d.maxRetries; attempt++ {
+		// Try the operation
+		err := fn()
+		if err == nil {
+			return nil // Success
+		}
+		
+		lastErr = err
+		
+		// Check if we've exhausted retries
+		if attempt == d.maxRetries {
+			break
+		}
+		
+		// Check if context was cancelled
+		if ctx != nil {
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("%s cancelled: %w", operation, ctx.Err())
+			default:
+			}
+		}
+		
+		// Log retry attempt if verbose
+		if d.verbose {
+			fmt.Printf("Retry %d/%d for %s after error: %v. Waiting %v before retry...\n", 
+				attempt+1, d.maxRetries, operation, err, delay)
+		}
+		
+		// Wait with context cancellation support
+		if ctx != nil {
+			timer := time.NewTimer(delay)
+			select {
+			case <-timer.C:
+				// Continue to next retry
+			case <-ctx.Done():
+				timer.Stop()
+				return fmt.Errorf("%s cancelled during retry: %w", operation, ctx.Err())
+			}
+		} else {
+			time.Sleep(delay)
+		}
+		
+		// Calculate next delay with exponential backoff
+		delay = time.Duration(float64(delay) * d.backoffFactor)
+		if delay > d.maxDelay {
+			delay = d.maxDelay
+		}
+	}
+	
+	return fmt.Errorf("%s failed after %d retries: %w", operation, d.maxRetries, lastErr)
+}
+
 func (d *Downloader) getFileSize() error {
-	resp, err := d.client.Head(d.url)
-	if err != nil {
-		return fmt.Errorf("failed to get file size: %w", err)
-	}
-	defer resp.Body.Close()
+	var resp *http.Response
+	var size int64
+	
+	err := d.retryWithBackoff(nil, "get file size", func() error {
+		var err error
+		resp, err = d.client.Head(d.url)
+		if err != nil {
+			return fmt.Errorf("failed to get file size: %w", err)
+		}
+		defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("failed to get file size: status %d", resp.StatusCode)
-	}
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("failed to get file size: status %d", resp.StatusCode)
+		}
 
-	size, err := strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 64)
+		size, err = strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 64)
+		if err != nil {
+			return fmt.Errorf("failed to parse content length: %w", err)
+		}
+		
+		return nil
+	})
+	
 	if err != nil {
-		return fmt.Errorf("failed to parse content length: %w", err)
+		return err
 	}
 
 	d.totalSize = size
@@ -158,66 +244,68 @@ func (d *Downloader) getFileSize() error {
 }
 
 func (d *Downloader) downloadChunk(ctx context.Context, start, end int64, writer io.Writer) error {
-	// Add timeout for individual chunks to prevent hanging
-	chunkCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
-	defer cancel()
+	return d.retryWithBackoff(ctx, fmt.Sprintf("download chunk %d-%d", start, end), func() error {
+		// Add timeout for individual chunks to prevent hanging
+		chunkCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		defer cancel()
 
-	req, err := http.NewRequestWithContext(chunkCtx, "GET", d.url, nil)
-	if err != nil {
-		return err
-	}
-
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
-
-	resp, err := d.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("chunk %d-%d request failed: %w", start, end, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-	}
-
-	buf := make([]byte, 1024*1024) // 1MB buffer for better performance
-	localDownloaded := int64(0)
-	for {
-		n, err := resp.Body.Read(buf)
-		if n > 0 {
-			// Apply rate limiting if configured
-			if d.rateLimiter != nil {
-				d.rateLimiter.WaitN(ctx, n)
-			}
-
-			if _, werr := writer.Write(buf[:n]); werr != nil {
-				return werr
-			}
-			localDownloaded += int64(n)
-
-			// Update global counter less frequently (every 10MB)
-			if localDownloaded >= 10*1024*1024 {
-				d.mu.Lock()
-				d.downloaded += localDownloaded
-				d.mu.Unlock()
-				localDownloaded = 0
-			}
-		}
-		if err == io.EOF {
-			break
-		}
+		req, err := http.NewRequestWithContext(chunkCtx, "GET", d.url, nil)
 		if err != nil {
 			return err
 		}
-	}
 
-	// Update remaining bytes
-	if localDownloaded > 0 {
-		d.mu.Lock()
-		d.downloaded += localDownloaded
-		d.mu.Unlock()
-	}
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
 
-	return nil
+		resp, err := d.client.Do(req)
+		if err != nil {
+			return fmt.Errorf("chunk %d-%d request failed: %w", start, end, err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		}
+
+		buf := make([]byte, 1024*1024) // 1MB buffer for better performance
+		localDownloaded := int64(0)
+		for {
+			n, err := resp.Body.Read(buf)
+			if n > 0 {
+				// Apply rate limiting if configured
+				if d.rateLimiter != nil {
+					d.rateLimiter.WaitN(ctx, n)
+				}
+
+				if _, werr := writer.Write(buf[:n]); werr != nil {
+					return werr
+				}
+				localDownloaded += int64(n)
+
+				// Update global counter less frequently (every 10MB)
+				if localDownloaded >= 10*1024*1024 {
+					d.mu.Lock()
+					d.downloaded += localDownloaded
+					d.mu.Unlock()
+					localDownloaded = 0
+				}
+			}
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return err
+			}
+		}
+
+		// Update remaining bytes
+		if localDownloaded > 0 {
+			d.mu.Lock()
+			d.downloaded += localDownloaded
+			d.mu.Unlock()
+		}
+
+		return nil
+	})
 }
 
 type progressMsg struct {
@@ -1021,58 +1109,60 @@ func (d *Downloader) downloadToFileWithResume(ctx context.Context, file *os.File
 	bufWriter := bufio.NewWriterSize(file, 16*1024*1024) // 16MB buffer
 	defer bufWriter.Flush()
 
-	// Download entire file or remaining part
-	req, err := http.NewRequestWithContext(ctx, "GET", d.url, nil)
-	if err != nil {
-		return err
-	}
-
-	// Add range header if resuming
-	if resumeFrom > 0 {
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", resumeFrom))
-	}
-
-	resp, err := d.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	// Check response status
-	expectedStatus := http.StatusOK
-	if resumeFrom > 0 {
-		expectedStatus = http.StatusPartialContent
-	}
-
-	if resp.StatusCode != expectedStatus {
-		// If we get 200 instead of 206 when resuming, server doesn't support resume
-		if resumeFrom > 0 && resp.StatusCode == http.StatusOK {
-			// Start from beginning
-			d.downloaded = 0
-			if _, err := file.Seek(0, 0); err != nil {
-				return err
-			}
-			if err := file.Truncate(0); err != nil {
-				return err
-			}
-		} else {
-			return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	return d.retryWithBackoff(ctx, "download file", func() error {
+		// Download entire file or remaining part
+		req, err := http.NewRequestWithContext(ctx, "GET", d.url, nil)
+		if err != nil {
+			return err
 		}
-	}
 
-	// Copy with rate limiting
-	var reader io.Reader = resp.Body
-	if d.rateLimiter != nil {
-		reader = &rateLimitedReader{
-			reader:     resp.Body,
-			limiter:    d.rateLimiter,
-			ctx:        ctx,
-			downloader: d,
+		// Add range header if resuming
+		if resumeFrom > 0 {
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", resumeFrom))
 		}
-	}
 
-	_, err = io.Copy(bufWriter, reader)
-	return err
+		resp, err := d.client.Do(req)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+
+		// Check response status
+		expectedStatus := http.StatusOK
+		if resumeFrom > 0 {
+			expectedStatus = http.StatusPartialContent
+		}
+
+		if resp.StatusCode != expectedStatus {
+			// If we get 200 instead of 206 when resuming, server doesn't support resume
+			if resumeFrom > 0 && resp.StatusCode == http.StatusOK {
+				// Start from beginning
+				d.downloaded = 0
+				if _, err := file.Seek(0, 0); err != nil {
+					return err
+				}
+				if err := file.Truncate(0); err != nil {
+					return err
+				}
+			} else {
+				return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+			}
+		}
+
+		// Copy with rate limiting
+		var reader io.Reader = resp.Body
+		if d.rateLimiter != nil {
+			reader = &rateLimitedReader{
+				reader:     resp.Body,
+				limiter:    d.rateLimiter,
+				ctx:        ctx,
+				downloader: d,
+			}
+		}
+
+		_, err = io.Copy(bufWriter, reader)
+		return err
+	})
 }
 
 type rateLimitedReader struct {
@@ -1104,6 +1194,8 @@ func main() {
 		resume         = flag.Bool("resume", false, "Resume interrupted download (ZIP files only)")
 		verbose        = flag.Bool("verbose", false, "Show detailed progress of individual chunks")
 		memoryLimit    = flag.String("memory", "auto", "Memory limit for buffers (e.g., 1G, 500M, auto for 10% of system memory)")
+		maxRetries     = flag.Int("max-retries", defaultMaxRetries, "Maximum number of retry attempts for failed connections")
+		retryDelay     = flag.Duration("retry-delay", defaultInitialDelay, "Initial retry delay (e.g., 1s, 500ms)")
 	)
 	flag.Parse()
 
@@ -1123,6 +1215,8 @@ func main() {
 		fmt.Fprintln(os.Stderr, "  -proxy URL     HTTP proxy URL (e.g., http://proxy:8080)")
 		fmt.Fprintln(os.Stderr, "  -limit RATE    Bandwidth limit (e.g., 1M, 500K, 2.5M)")
 		fmt.Fprintln(os.Stderr, "  -resume        Resume interrupted download (ZIP files only)")
+		fmt.Fprintln(os.Stderr, "  -max-retries N Maximum retry attempts for failed connections (default: 10)")
+		fmt.Fprintln(os.Stderr, "  -retry-delay D Initial retry delay (default: 1s)")
 		fmt.Fprintln(os.Stderr, "\nSupported archive formats:")
 		fmt.Fprintln(os.Stderr, "  .zip, .tar, .tar.gz, .tgz, .tar.bz2, .tbz2, .tar.xz, .txz")
 		fmt.Fprintln(os.Stderr, "  .tar.lz4, .tar.zst, .tar.zstd, .tar.lzma, .tar.Z")
@@ -1164,7 +1258,7 @@ func main() {
 		fmt.Printf("Memory limit: %s (chunk size: %s)\n", formatBytes(memBytes), formatBytes(*chunkSize))
 	}
 
-	downloader := NewDownloader(url, *workers, *chunkSize, *proxyURL, limitBytes, *verbose)
+	downloader := NewDownloader(url, *workers, *chunkSize, *proxyURL, limitBytes, *verbose, *maxRetries, *retryDelay)
 
 	// Get file size first
 	if err := downloader.getFileSize(); err != nil {
