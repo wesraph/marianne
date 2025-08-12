@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/charmbracelet/bubbles/progress"
@@ -77,7 +78,7 @@ type Downloader struct {
 	chunkSize      int64
 	client         *http.Client
 	totalSize      int64
-	downloaded     int64
+	downloaded     atomic.Int64  // Use atomic for thread-safe counter
 	startTime      time.Time
 	rateLimiter    *rate.Limiter
 	bandwidthLimit int64
@@ -267,7 +268,6 @@ func (d *Downloader) downloadChunk(ctx context.Context, start, end int64, writer
 		}
 
 		buf := make([]byte, 1024*1024) // 1MB buffer for better performance
-		localDownloaded := int64(0)
 		for {
 			n, err := resp.Body.Read(buf)
 			if n > 0 {
@@ -279,15 +279,7 @@ func (d *Downloader) downloadChunk(ctx context.Context, start, end int64, writer
 				if _, werr := writer.Write(buf[:n]); werr != nil {
 					return werr
 				}
-				localDownloaded += int64(n)
-
-				// Update global counter less frequently (every 10MB)
-				if localDownloaded >= 10*1024*1024 {
-					d.mu.Lock()
-					d.downloaded += localDownloaded
-					d.mu.Unlock()
-					localDownloaded = 0
-				}
+				// Don't update counter here - let parallel_download.go handle it
 			}
 			if err == io.EOF {
 				break
@@ -295,13 +287,6 @@ func (d *Downloader) downloadChunk(ctx context.Context, start, end int64, writer
 			if err != nil {
 				return err
 			}
-		}
-
-		// Update remaining bytes
-		if localDownloaded > 0 {
-			d.mu.Lock()
-			d.downloaded += localDownloaded
-			d.mu.Unlock()
 		}
 
 		return nil
@@ -597,7 +582,7 @@ func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir str
 			if (oldETag != "" && oldETag != d.state.ETag) ||
 				(oldLastModified != "" && oldLastModified != d.state.LastModified) {
 				p.Send(fileExtractedMsg("Warning: Remote file has changed, starting fresh download"))
-				d.downloaded = 0
+				d.downloaded.Store(0)
 				d.state.Downloaded = 0
 				d.state.TempFile = ""
 			}
@@ -736,10 +721,8 @@ func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir str
 		for {
 			select {
 			case <-ticker.C:
-				d.mu.Lock()
-				currentDownloaded := d.downloaded
+				currentDownloaded := d.downloaded.Load()
 				currentTime := time.Now()
-				d.mu.Unlock()
 
 				// Calculate speed
 				timeDiff := currentTime.Sub(lastTime).Seconds()
@@ -895,7 +878,7 @@ func (d *Downloader) saveState() error {
 		}
 	}
 
-	d.state.Downloaded = d.downloaded
+	d.state.Downloaded = d.downloaded.Load()
 	d.state.Updated = time.Now()
 
 	data, err := json.MarshalIndent(d.state, "", "  ")
@@ -924,7 +907,7 @@ func (d *Downloader) loadState() error {
 	}
 
 	d.state = state
-	d.downloaded = state.Downloaded
+	d.downloaded.Store(state.Downloaded)
 	return nil
 }
 
@@ -949,7 +932,7 @@ func (d *Downloader) downloadAndExtractZip(ctx context.Context, p *tea.Program, 
 				// Open for append
 				tmpFile, err = os.OpenFile(d.resumeFile, os.O_RDWR, 0644)
 				if err == nil {
-					d.downloaded = existingSize
+					d.downloaded.Store(existingSize)
 					p.Send(progressMsg{
 						downloaded: existingSize,
 						total:      d.totalSize,
@@ -998,10 +981,8 @@ func (d *Downloader) downloadAndExtractZip(ctx context.Context, p *tea.Program, 
 		for {
 			select {
 			case <-ticker.C:
-				d.mu.Lock()
-				currentDownloaded := d.downloaded
+				currentDownloaded := d.downloaded.Load()
 				currentTime := time.Now()
-				d.mu.Unlock()
 
 				// Calculate speed
 				timeDiff := currentTime.Sub(lastTime).Seconds()
@@ -1137,7 +1118,7 @@ func (d *Downloader) downloadToFileWithResume(ctx context.Context, file *os.File
 			// If we get 200 instead of 206 when resuming, server doesn't support resume
 			if resumeFrom > 0 && resp.StatusCode == http.StatusOK {
 				// Start from beginning
-				d.downloaded = 0
+				d.downloaded.Store(0)
 				if _, err := file.Seek(0, 0); err != nil {
 					return err
 				}
@@ -1176,9 +1157,7 @@ func (r *rateLimitedReader) Read(p []byte) (int, error) {
 	n, err := r.reader.Read(p)
 	if n > 0 {
 		r.limiter.WaitN(r.ctx, n)
-		r.downloader.mu.Lock()
-		r.downloader.downloaded += int64(n)
-		r.downloader.mu.Unlock()
+		r.downloader.downloaded.Add(int64(n))
 	}
 	return n, err
 }

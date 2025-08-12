@@ -154,18 +154,12 @@ func (d *Downloader) downloadInOrderParallel(ctx context.Context, writer io.Writ
 								writerErr <- fmt.Errorf("failed to write chunk %d: %w", nextExpectedChunk, err)
 								return
 							}
+							// Update progress based on actual bytes written
+							d.downloaded.Add(int64(len(data)))
 						}
 						delete(pendingChunks, nextExpectedChunk)
 						nextExpectedChunk++
 						chunksWritten++
-						
-						// Update progress more accurately
-						d.mu.Lock()
-						d.downloaded = int64(nextExpectedChunk) * d.chunkSize
-						if d.downloaded > d.totalSize {
-							d.downloaded = d.totalSize
-						}
-						d.mu.Unlock()
 					} else {
 						break
 					}
