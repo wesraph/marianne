@@ -27,7 +27,7 @@ jobs:
       run: go mod verify
 
     - name: Build
-      run: go build -v ./...
+      run: go build -trimpath -ldflags="-s -w" -v ./...
 
     - name: Run go vet
       run: go vet ./...
@@ -68,9 +68,9 @@ jobs:
       run: go mod download
 
     - name: Build
-      run: go build -v ./...
+      run: go build -trimpath -ldflags="-s -w" -v ./...
 
     - name: Test build binary
       run: |
-        go build -o marianne${{ matrix.os == 'windows-latest' && '.exe' || '' }} .
+        go build -trimpath -ldflags="-s -w" -o marianne${{ matrix.os == 'windows-latest' && '.exe' || '' }} .
         ./marianne${{ matrix.os == 'windows-latest' && '.exe' || '' }} -h || true

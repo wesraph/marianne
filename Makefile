@@ -1,12 +1,12 @@
 .PHONY: build static clean
 
-# Default build
+# Default build with size optimizations
 build:
-	go build -o marianne .
+	go build -trimpath -ldflags="-s -w" -o marianne .
 
-# Static build
+# Static build with size optimizations
 static:
-	CGO_ENABLED=0 GOOS=linux go build -a -ldflags '-extldflags "-static"' -o marianne .
+	CGO_ENABLED=0 GOOS=linux go build -trimpath -a -ldflags '-extldflags "-static" -s -w' -o marianne .
 
 # Clean build artifacts
 clean:

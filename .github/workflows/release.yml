@@ -79,7 +79,7 @@ jobs:
           VERSION="dev-${GITHUB_SHA::8}"
         fi
         
-        go build -a -ldflags "-extldflags '-static' -s -w -X main.Version=${VERSION}" -o "${output_name}" .
+        go build -trimpath -a -ldflags "-extldflags '-static' -s -w -X main.Version=${VERSION}" -o "${output_name}" .
         
     - name: Upload artifact
       uses: actions/upload-artifact@v4
