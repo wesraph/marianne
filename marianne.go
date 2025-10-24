@@ -400,19 +400,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.progress.Width = msg.Width - 4
 		m.viewport.Width = msg.Width - 4
 
-		// Calculate viewport height dynamically based on active chunks
+		// Calculate viewport height with fixed space for chunks to prevent UI shifting
 		// Base UI: header(3) + progress bar(2) + stats(2) + files header(2) + padding(4) = 13 lines
-		// Chunk details: header(2) + up to 10 chunk lines = 12 lines max
-		activeChunks := m.countActiveChunks()
-		displayLimit := 10
-		if activeChunks < displayLimit {
-			displayLimit = activeChunks
-		}
-		chunkLines := 0
-		if displayLimit > 0 {
-			chunkLines = 2 + displayLimit // header + chunk lines
-		}
-		reservedLines := 13 + chunkLines
+		// Chunk details: header(2) + up to 10 chunk lines = 12 lines max (always reserved)
+		const maxChunkLines = 12 // 2 (header) + 10 (max chunk display)
+
+		// Always reserve space for chunks to prevent UI from shifting when they appear/disappear
+		reservedLines := 13 + maxChunkLines
 
 		// Ensure minimum viewport height of 5 lines
 		if msg.Height-reservedLines < 5 {
@@ -549,14 +543,14 @@ func (m model) View() string {
 		MarginTop(1).
 		Render(statsText)
 
-	// Build detailed chunk progress view (always show if we have chunks)
-	var chunkDetailsView string
-	if len(m.chunkProgress) > 0 {
-		chunkLines := []string{}
-		activeChunks := 0
-		completedChunks := 0
-		failedChunks := 0
+	// Build detailed chunk progress view (always show with fixed height to prevent UI shifting)
+	const displayLimit = 10
+	chunkLines := make([]string, 0, displayLimit)
+	activeChunks := 0
+	completedChunks := 0
+	failedChunks := 0
 
+	if len(m.chunkProgress) > 0 {
 		// Sort chunks by index for consistent display
 		indices := make([]int, 0, len(m.chunkProgress))
 		for idx := range m.chunkProgress {
@@ -565,7 +559,6 @@ func (m model) View() string {
 		sort.Ints(indices)
 
 		// Show only last 10 active chunks to avoid UI overflow
-		displayLimit := 10
 		activeDisplayed := 0
 
 		for _, idx := range indices {
@@ -609,31 +602,35 @@ func (m model) View() string {
 				failedChunks++
 			}
 		}
-
-		// Build chunk summary header
-		chunkSummary := fmt.Sprintf("Chunks: %d active, %d completed", activeChunks, completedChunks)
-		if failedChunks > 0 {
-			chunkSummary += fmt.Sprintf(", %d failed", failedChunks)
-		}
-		if activeChunks > displayLimit {
-			chunkSummary += fmt.Sprintf(" (showing %d/%d active)", displayLimit, activeChunks)
-		}
-
-		chunkHeader := lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("214")).
-			MarginTop(1).
-			MarginBottom(1).
-			Render(fmt.Sprintf("⚡ %s", chunkSummary))
-
-		if len(chunkLines) > 0 {
-			chunkDetailsView = lipgloss.JoinVertical(
-				lipgloss.Left,
-				chunkHeader,
-				strings.Join(chunkLines, "\n"),
-			)
-		}
 	}
+
+	// Pad chunk lines to always have fixed height (10 lines)
+	for len(chunkLines) < displayLimit {
+		chunkLines = append(chunkLines, "")
+	}
+
+	// Build chunk summary header
+	chunkSummary := fmt.Sprintf("Chunks: %d active, %d completed", activeChunks, completedChunks)
+	if failedChunks > 0 {
+		chunkSummary += fmt.Sprintf(", %d failed", failedChunks)
+	}
+	if activeChunks > displayLimit {
+		chunkSummary += fmt.Sprintf(" (showing %d/%d active)", displayLimit, activeChunks)
+	}
+
+	chunkHeader := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("214")).
+		MarginTop(1).
+		MarginBottom(1).
+		Render(fmt.Sprintf("⚡ %s", chunkSummary))
+
+	// Always render chunk section with fixed height to prevent UI shifting
+	chunkDetailsView := lipgloss.JoinVertical(
+		lipgloss.Left,
+		chunkHeader,
+		strings.Join(chunkLines, "\n"),
+	)
 
 	// Extracted files section
 	filesHeader := lipgloss.NewStyle().
@@ -643,14 +640,8 @@ func (m model) View() string {
 		MarginBottom(1).
 		Render("📂 Extracted Files:")
 
-	// Combine all elements
-	elements := []string{header, prog, stats}
-
-	if chunkDetailsView != "" {
-		elements = append(elements, chunkDetailsView)
-	}
-
-	elements = append(elements, filesHeader, m.viewport.View())
+	// Combine all elements (always include chunk section for fixed layout)
+	elements := []string{header, prog, stats, chunkDetailsView, filesHeader, m.viewport.View()}
 
 	return lipgloss.JoinVertical(lipgloss.Left, elements...)
 }
