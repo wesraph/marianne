@@ -392,7 +392,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.progress.Width = msg.Width - 4
 		m.viewport.Width = msg.Width - 4
-		m.viewport.Height = msg.Height - 12 // Leave room for progress and stats
+
+		// Calculate viewport height dynamically based on active chunks
+		// Base UI: header(3) + progress bar(2) + stats(2) + files header(2) + padding(4) = 13 lines
+		// Chunk details: header(2) + up to 10 chunk lines = 12 lines max
+		activeChunks := m.countActiveChunks()
+		displayLimit := 10
+		if activeChunks < displayLimit {
+			displayLimit = activeChunks
+		}
+		chunkLines := 0
+		if displayLimit > 0 {
+			chunkLines = 2 + displayLimit // header + chunk lines
+		}
+		reservedLines := 13 + chunkLines
+
+		// Ensure minimum viewport height of 5 lines
+		if msg.Height-reservedLines < 5 {
+			m.viewport.Height = 5
+		} else {
+			m.viewport.Height = msg.Height - reservedLines
+		}
 
 	case progressMsg:
 		m.downloaded = msg.downloaded
@@ -460,6 +480,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.viewport, cmd = m.viewport.Update(msg)
 	return m, cmd
+}
+
+// countActiveChunks returns the number of chunks that are currently being downloaded
+func (m model) countActiveChunks() int {
+	count := 0
+	for _, chunk := range m.chunkProgress {
+		if chunk.status == "started" || chunk.status == "progress" {
+			count++
+		}
+	}
+	return count
 }
 
 func (m model) View() string {
