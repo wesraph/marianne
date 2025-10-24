@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -248,15 +249,18 @@ func TestDownloadChunkServerNoRangeSupport(t *testing.T) {
 	ctx := context.Background()
 	var buf bytes.Buffer
 
-	// Try to download a chunk - server should return full content
+	// Try to download a chunk - should fail because server doesn't support ranges
+	// When server doesn't support ranges, it returns 200 OK with full content,
+	// which is incompatible with parallel downloads and would corrupt the file
 	err := d.downloadChunk(ctx, 1024, 2047, &buf)
-	if err != nil {
-		t.Fatalf("downloadChunk() error = %v, want nil (server returns full content)", err)
+	if err == nil {
+		t.Fatal("downloadChunk() error = nil, want error for server without range support")
 	}
 
-	// Server returns entire file when ranges not supported
-	if buf.Len() != len(content) {
-		t.Logf("Downloaded %d bytes (server sent full content)", buf.Len())
+	// Verify the error message indicates the problem
+	expectedErrMsg := "server does not support range requests"
+	if !strings.Contains(err.Error(), expectedErrMsg) {
+		t.Errorf("downloadChunk() error = %v, want error containing %q", err, expectedErrMsg)
 	}
 }
 

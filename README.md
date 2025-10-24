@@ -8,7 +8,7 @@
 
 <div align="center">
 
-![Go Version](https://img.shields.io/badge/Go-1.21%2B-blue)
+![Go Version](https://img.shields.io/badge/Go-1.25.3%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macos%20%7C%20windows-lightgrey)
 [![CI](https://github.com/wesraph/marianne/actions/workflows/ci.yml/badge.svg)](https://github.com/wesraph/marianne/actions/workflows/ci.yml)
@@ -20,10 +20,34 @@
 
 - **⚡ Parallel Downloads**: Split files into chunks and download them concurrently for maximum speed
 - **📊 Beautiful TUI**: Real-time progress bar, download stats, and live file extraction view
-- **🗜️ Auto-extraction**: Automatically detects and extracts various archive formats
-- **💾 Memory Efficient**: Streams data directly to tar, perfect for terabyte-sized files
+- **🗜️ Auto-extraction**: Automatically detects and extracts various archive formats (ZIP, TAR, etc.)
+- **💾 Memory Efficient**: Automatic memory management with configurable limits
+- **🔄 Retry Logic**: Exponential backoff retry for robust downloads over unreliable connections
 - **📁 Output Control**: Specify output directory with automatic creation
-- **🎯 Smart Chunking**: Optimized chunk sizes for best performance
+- **🎯 Smart Chunking**: Optimized chunk sizes based on available memory
+- **🌐 Proxy Support**: HTTP proxy support for corporate networks
+- **⏱️ Rate Limiting**: Bandwidth limiting to avoid network congestion
+- **📝 Verbose Mode**: Detailed chunk-level progress for debugging
+
+## 🏗️ How It Works
+
+Marianne uses a sophisticated parallel downloading architecture:
+
+1. **File Size Detection**: Performs a HEAD request to determine the total file size
+2. **Chunk Planning**: Divides the file into chunks based on configured chunk size
+3. **Parallel Workers**: Spawns multiple workers (default: 8) to download chunks concurrently
+4. **In-Order Assembly**: Downloaded chunks are buffered and written in sequence to maintain file integrity
+5. **Memory Management**: Limits buffered chunks based on available memory to prevent OOM
+6. **Stream Extraction**: For TAR files, pipes data directly to `tar` command for on-the-fly extraction
+7. **Temp File Extraction**: For ZIP files, downloads to temp file then extracts (enables future resume support)
+
+### Key Components
+
+- **Worker Pool**: Concurrent goroutines download chunks in parallel
+- **Rate Limiter**: Optional bandwidth throttling using token bucket algorithm
+- **Retry Logic**: Exponential backoff for transient network failures
+- **Progress Tracking**: Real-time UI updates using Bubble Tea framework
+- **Chunk Coordinator**: Ensures chunks are written in correct order despite parallel downloads
 
 ## 📸 Screenshot
 
@@ -45,11 +69,12 @@ Progress: 45.2% | Downloaded: 2.3 GB/5.1 GB | Speed: 25.4 MB/s | Avg: 22.1 MB/s 
 
 ## 🆕 What's New
 
-- **Resume Support**: Resume interrupted downloads with `-resume` flag
-- **ZIP Support**: Now supports ZIP file extraction
+- **ZIP Support**: Now supports ZIP file extraction alongside TAR archives
 - **HTTP Proxy**: Connect through HTTP proxies with `-proxy` flag
 - **Bandwidth Limiting**: Control download speed with `-limit` flag
-- **State Files**: Automatic state saving for reliable resume capability
+- **Memory Management**: Automatic memory limit detection with `-memory` flag
+- **Retry Logic**: Configurable retry attempts with exponential backoff
+- **Verbose Mode**: Detailed chunk-level progress tracking with `-verbose` flag
 
 ## 🔧 Installation
 
@@ -90,10 +115,12 @@ make static
 
 ### Requirements
 
-- Go 1.21 or higher
+- Go 1.25.3 or higher (for building from source)
 - `tar` command (pre-installed on most Unix systems)
-- For `.tar.lz4`: `lz4` command
-- For `.tar.zst`: `zstd` command
+- For `.tar.lz4`: `lz4` command (install via package manager)
+- For `.tar.zst`: `zstd` command (install via package manager)
+
+**Note**: Pre-built binaries have no runtime dependencies except for the decompression tools needed for the specific archive format you're downloading.
 
 ## 📖 Usage
 
@@ -118,11 +145,17 @@ make static
 # Limit bandwidth to 2.5 MB/s
 ./marianne -limit 2.5M https://example.com/large-file.tar.gz
 
-# Combine options
-./marianne -output /data -workers 4 -limit 1M -proxy http://proxy:3128 https://example.com/archive.zip
+# Show detailed chunk progress
+./marianne -verbose https://example.com/archive.tar.gz
 
-# Resume an interrupted download
-./marianne -resume https://example.com/large-file.zip
+# Set memory limit for buffering
+./marianne -memory 2G https://example.com/huge.tar.lz4
+
+# Configure retry behavior
+./marianne -max-retries 5 -retry-delay 2s https://example.com/unreliable-server.zip
+
+# Combine options
+./marianne -output /data -workers 16 -memory 4G -verbose -limit 10M https://example.com/archive.zip
 ```
 
 ### Options
@@ -130,11 +163,15 @@ make static
 | Flag | Description | Default |
 |------|-------------|---------|
 | `-workers` | Number of parallel download workers | 8 |
-| `-chunk` | Chunk size in bytes | 104857600 (100MB) |
+| `-chunk` | Chunk size in bytes | 2097152 (2MB) |
 | `-output` | Output directory (creates if doesn't exist) | Current directory |
 | `-proxy` | HTTP proxy URL (e.g., http://proxy:8080) | None |
 | `-limit` | Bandwidth limit (e.g., 1M, 500K, 2.5M) | Unlimited |
-| `-resume` | Resume interrupted download | false |
+| `-memory` | Memory limit for buffers (e.g., 1G, 500M, auto) | auto (10% of system memory) |
+| `-verbose` | Show detailed chunk-level progress | false |
+| `-max-retries` | Maximum retry attempts for failed connections | 10 |
+| `-retry-delay` | Initial retry delay (e.g., 1s, 500ms) | 1s |
+| `-version` | Show version and exit | N/A |
 
 ## 🗂️ Supported Archive Formats
 
@@ -174,11 +211,22 @@ make clean
    ./marianne -workers 16 URL
    ```
 
-2. **Adjust chunk size** based on your connection:
-   - Slower connections: Use smaller chunks (50MB)
-   - Faster connections: Use larger chunks (200MB+)
+2. **Adjust memory limit** based on your system:
+   - Systems with limited RAM: Use smaller memory limits (e.g., `-memory 500M`)
+   - High-memory systems: Increase limit for better buffering (e.g., `-memory 4G`)
+   - The tool automatically calculates optimal chunk sizes based on memory
 
-3. **Use SSD** for extraction target to avoid I/O bottlenecks
+3. **Adjust chunk size** based on your connection:
+   - Slower connections: Use smaller chunks (1-2MB)
+   - Faster connections: Use larger chunks (10MB+)
+   - Default is 2MB, automatically adjusted based on memory settings
+
+4. **Use SSD** for extraction target to avoid I/O bottlenecks
+
+5. **Configure retries** for unreliable connections:
+   ```bash
+   ./marianne -max-retries 20 -retry-delay 2s URL
+   ```
 
 ## 🤝 Contributing
 
@@ -204,45 +252,52 @@ Example downloading a 5GB file on a gigabit connection:
 
 *Results may vary based on server capabilities and network conditions*
 
-## 💾 Resume Support
+## ⚙️ Advanced Features
 
-Marianne saves download state automatically, allowing you to resume interrupted downloads:
+### Memory Management
+Marianne automatically manages memory usage to prevent system overload:
+- Default: Uses 10% of system memory for buffering
+- Adjusts chunk sizes based on available memory
+- Prevents excessive memory consumption on large parallel downloads
+- Configure manually with `-memory` flag for fine-tuning
 
-- **State files** are saved in the system temp directory
-- **Automatic validation** ensures the remote file hasn't changed
-- **ZIP downloads** can be resumed from where they left off (true byte-range resume)
-- **TAR archives** resume by re-downloading but skipping already-extracted files
+### Retry Logic
+Robust retry mechanism with exponential backoff:
+- Automatically retries failed chunk downloads (default: 10 attempts)
+- Exponential backoff prevents server overload (1s to 30s delay)
+- Configurable with `-max-retries` and `-retry-delay` flags
+- Individual chunk retries don't affect other parallel downloads
 
-### How Resume Works
+### Chunk-Level Progress
+With `-verbose` flag, monitor individual chunk progress:
+- Real-time status of each downloading chunk
+- Per-chunk download speeds
+- Worker assignment and timing information
+- Useful for debugging and performance optimization
 
-#### For ZIP files:
-- Downloads are saved to a temporary file
-- On resume, download continues from the exact byte where it stopped
-- No bandwidth is wasted re-downloading data
-
-#### For TAR archives:
-- Due to TAR's sequential format, we can't skip to the middle
-- On resume, the download restarts but extraction skips existing files
-- This prevents file corruption and ensures consistency
-
-To resume a download, simply add the `-resume` flag:
-```bash
-./marianne -resume https://example.com/large-file.zip
-```
+### Security Features
+Built-in security protections for safe archive extraction:
+- **Path Traversal Prevention**: Validates all ZIP entry paths
+- **Absolute Path Blocking**: Rejects absolute paths in archives
+- **Directory Escape Detection**: Ensures extracted files stay within output directory
+- **Symlink Safety**: Proper handling of file permissions and modes
 
 ## 🐛 Known Issues
 
 - RAR and 7z formats are not yet supported
 - Windows support requires tar to be installed (available in Windows 10+)
-- TAR archive extraction cannot be resumed mid-stream (must restart extraction)
+- Downloads cannot be resumed after interruption (future feature)
 
 ## 🗺️ Roadmap
 
 - [x] Support for ZIP archives
 - [x] HTTP proxy support
 - [x] Bandwidth limiting options
-- [x] Resume interrupted downloads
+- [x] Memory management and optimization
+- [x] Retry logic with exponential backoff
+- [x] Verbose mode for chunk-level debugging
+- [ ] Resume interrupted downloads
 - [ ] Configuration file support
 - [ ] Parallel ZIP extraction
 - [ ] Support for RAR and 7z archives
-- [ ] Resume support for TAR archives
+- [ ] Streaming mode (extract without full download for TAR)

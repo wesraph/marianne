@@ -30,15 +30,15 @@ import (
 
 // Retry configuration
 const (
-	defaultMaxRetries     = 10          // Maximum number of retry attempts
-	defaultInitialDelay   = 1 * time.Second  // Initial retry delay
-	defaultMaxDelay       = 30 * time.Second // Maximum retry delay
-	defaultBackoffFactor  = 2.0         // Exponential backoff multiplier
+	defaultMaxRetries    = 10               // Maximum number of retry attempts
+	defaultInitialDelay  = 1 * time.Second  // Initial retry delay
+	defaultMaxDelay      = 30 * time.Second // Maximum retry delay
+	defaultBackoffFactor = 2.0              // Exponential backoff multiplier
 )
 
 const (
-	defaultWorkers   = 8                  // Balanced worker count
-	defaultChunkSize = 2 * 1024 * 1024    // 2MB chunks for better granularity
+	defaultWorkers   = 8               // Balanced worker count
+	defaultChunkSize = 2 * 1024 * 1024 // 2MB chunks for better granularity
 )
 
 var (
@@ -46,14 +46,13 @@ var (
 	Version = "dev"
 )
 
-
 type Downloader struct {
 	url            string
 	workers        int
 	chunkSize      int64
 	client         *http.Client
 	totalSize      int64
-	downloaded     atomic.Int64  // Use atomic for thread-safe counter
+	downloaded     atomic.Int64 // Use atomic for thread-safe counter
 	startTime      time.Time
 	rateLimiter    *rate.Limiter
 	bandwidthLimit int64
@@ -62,7 +61,7 @@ type Downloader struct {
 	initialDelay   time.Duration
 	maxDelay       time.Duration
 	backoffFactor  float64
-	memoryLimit    int64         // Memory limit for buffering chunks
+	memoryLimit    int64 // Memory limit for buffering chunks
 }
 
 func NewDownloader(url string, workers int, chunkSize int64, proxyURL string, bandwidthLimit int64, verbose bool, maxRetries int, retryDelay time.Duration, memoryLimit int64) *Downloader {
@@ -128,21 +127,21 @@ func NewDownloader(url string, workers int, chunkSize int64, proxyURL string, ba
 func (d *Downloader) retryWithBackoff(ctx context.Context, operation string, fn func() error) error {
 	var lastErr error
 	delay := d.initialDelay
-	
+
 	for attempt := 0; attempt <= d.maxRetries; attempt++ {
 		// Try the operation
 		err := fn()
 		if err == nil {
 			return nil // Success
 		}
-		
+
 		lastErr = err
-		
+
 		// Check if we've exhausted retries
 		if attempt == d.maxRetries {
 			break
 		}
-		
+
 		// Check if context was cancelled
 		if ctx != nil {
 			select {
@@ -151,13 +150,13 @@ func (d *Downloader) retryWithBackoff(ctx context.Context, operation string, fn 
 			default:
 			}
 		}
-		
+
 		// Log retry attempt if verbose
 		if d.verbose {
-			fmt.Printf("Retry %d/%d for %s after error: %v. Waiting %v before retry...\n", 
+			fmt.Printf("Retry %d/%d for %s after error: %v. Waiting %v before retry...\n",
 				attempt+1, d.maxRetries, operation, err, delay)
 		}
-		
+
 		// Wait with context cancellation support
 		if ctx != nil {
 			timer := time.NewTimer(delay)
@@ -171,14 +170,14 @@ func (d *Downloader) retryWithBackoff(ctx context.Context, operation string, fn 
 		} else {
 			time.Sleep(delay)
 		}
-		
+
 		// Calculate next delay with exponential backoff
 		delay = time.Duration(float64(delay) * d.backoffFactor)
 		if delay > d.maxDelay {
 			delay = d.maxDelay
 		}
 	}
-	
+
 	return fmt.Errorf("%s failed after %d retries: %w", operation, d.maxRetries, lastErr)
 }
 
@@ -202,10 +201,10 @@ func (d *Downloader) getFileSize() error {
 		if err != nil {
 			return fmt.Errorf("failed to parse content length: %w", err)
 		}
-		
+
 		return nil
 	})
-	
+
 	if err != nil {
 		return err
 	}
@@ -237,7 +236,13 @@ func (d *Downloader) downloadChunkWithProgress(ctx context.Context, start, end i
 		}
 		defer resp.Body.Close()
 
-		if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
+		// Servers that don't support range requests will return 200 OK with full content
+		// This is incompatible with parallel downloading, so we must reject it
+		if resp.StatusCode == http.StatusOK {
+			return fmt.Errorf("server does not support range requests (got 200 OK instead of 206 Partial Content) - parallel downloads not possible")
+		}
+
+		if resp.StatusCode != http.StatusPartialContent {
 			return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 		}
 
@@ -481,17 +486,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.viewport, cmd = m.viewport.Update(msg)
 	return m, cmd
-}
-
-// countActiveChunks returns the number of chunks that are currently being downloaded
-func (m model) countActiveChunks() int {
-	count := 0
-	for _, chunk := range m.chunkProgress {
-		if chunk.status == "started" || chunk.status == "progress" {
-			count++
-		}
-	}
-	return count
 }
 
 func (m model) View() string {
@@ -861,11 +855,6 @@ func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir str
 	return nil
 }
 
-
-
-
-
-
 func parseBandwidthLimit(limit string) int64 {
 	limit = strings.TrimSpace(strings.ToUpper(limit))
 	if limit == "" {
@@ -924,7 +913,6 @@ func parseMemoryLimit(limit string, workers int) int64 {
 	// Parse the provided limit
 	return parseBandwidthLimit(limit)
 }
-
 
 func (d *Downloader) downloadAndExtractZip(ctx context.Context, p *tea.Program, outputDir string) error {
 	// Create temp file
