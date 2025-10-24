@@ -185,10 +185,10 @@ func (d *Downloader) downloadInOrderParallel(ctx context.Context, writer io.Writ
 					return
 				}
 				
-				// Store out-of-order chunks for later
+				// Store all chunks for sequential writing
 				// Note: We removed the strict memory limit check here to prevent deadlock
 				// The large resultChan buffer (maxChunksInMemory) provides backpressure instead
-				if chunk.index != nextExpectedChunk && len(chunk.data) > 0 {
+				if len(chunk.data) > 0 {
 					pendingChunks[chunk.index] = chunk.data
 				}
 				

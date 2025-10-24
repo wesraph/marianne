@@ -288,6 +288,12 @@ func (d *Downloader) downloadChunkWithProgress(ctx context.Context, start, end i
 			}
 		}
 
+		// Verify we got the expected number of bytes
+		expectedBytes := end - start + 1
+		if totalRead != expectedBytes {
+			return fmt.Errorf("incomplete chunk: expected %d bytes, got %d bytes", expectedBytes, totalRead)
+		}
+
 		return nil
 	})
 }
@@ -790,17 +796,19 @@ func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir str
 				currentDownloaded := d.downloaded.Load()
 				currentTime := time.Now()
 
-				// Calculate speed
+				// Calculate instantaneous speed for display
 				timeDiff := currentTime.Sub(lastTime).Seconds()
 				if timeDiff > 0 {
 					bytesDiff := currentDownloaded - lastDownloaded
 					speed := float64(bytesDiff) / timeDiff
 
-					// Calculate ETA
+					// Calculate ETA based on average speed since start (more stable)
+					totalElapsed := time.Since(d.startTime).Seconds()
 					remaining := d.totalSize - currentDownloaded
 					var eta time.Duration
-					if speed > 0 {
-						eta = time.Duration(float64(remaining)/speed) * time.Second
+					if totalElapsed > 0 && currentDownloaded > 0 {
+						avgSpeed := float64(currentDownloaded) / totalElapsed
+						eta = time.Duration(float64(remaining)/avgSpeed) * time.Second
 					}
 
 					p.Send(progressMsg{
@@ -953,17 +961,19 @@ func (d *Downloader) downloadAndExtractZip(ctx context.Context, p *tea.Program, 
 				currentDownloaded := d.downloaded.Load()
 				currentTime := time.Now()
 
-				// Calculate speed
+				// Calculate instantaneous speed for display
 				timeDiff := currentTime.Sub(lastTime).Seconds()
 				if timeDiff > 0 {
 					bytesDiff := currentDownloaded - lastDownloaded
 					speed := float64(bytesDiff) / timeDiff
 
-					// Calculate ETA
+					// Calculate ETA based on average speed since start (more stable)
+					totalElapsed := time.Since(d.startTime).Seconds()
 					remaining := d.totalSize - currentDownloaded
 					var eta time.Duration
-					if speed > 0 {
-						eta = time.Duration(float64(remaining)/speed) * time.Second
+					if totalElapsed > 0 && currentDownloaded > 0 {
+						avgSpeed := float64(currentDownloaded) / totalElapsed
+						eta = time.Duration(float64(remaining)/avgSpeed) * time.Second
 					}
 
 					p.Send(progressMsg{
