@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -555,6 +556,7 @@ func (m model) View() string {
 		for idx := range m.chunkProgress {
 			indices = append(indices, idx)
 		}
+		sort.Ints(indices)
 
 		// Show only last 10 active chunks to avoid UI overflow
 		displayLimit := 10
