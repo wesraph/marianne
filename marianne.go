@@ -14,17 +14,20 @@ import (
 	neturl "net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"golang.org/x/term"
 	"golang.org/x/time/rate"
 )
 
@@ -39,7 +42,6 @@ const (
 const (
 	defaultWorkers   = 8                  // Balanced worker count
 	defaultChunkSize = 2 * 1024 * 1024    // 2MB chunks for better granularity
-	maxMemoryBuffer  = 1024 * 1024 * 1024 // 1GB max memory buffer
 )
 
 var (
@@ -52,6 +54,7 @@ type DownloadState struct {
 	URL            string       `json:"url"`
 	TotalSize      int64        `json:"total_size"`
 	Downloaded     int64        `json:"downloaded"`
+	BytePosition   int64        `json:"byte_position"` // Exact byte position in output file
 	ArchiveType    string       `json:"archive_type"`
 	OutputDir      string       `json:"output_dir"`
 	TempFile       string       `json:"temp_file"`
@@ -91,9 +94,29 @@ type Downloader struct {
 	maxDelay       time.Duration
 	backoffFactor  float64
 	mu             sync.Mutex
+	writeBuffer    *bufio.Writer // Track write buffer for flushing
+	currentFile    *os.File      // Track current file for proper cleanup
+	bytePosition   atomic.Int64  // Track exact byte position written (atomic to prevent race)
+	shutdown       chan struct{} // Signal for graceful shutdown
+	shutdownOnce   sync.Once     // Ensure shutdown is only called once
+	memoryLimit    int64         // Memory limit for buffering chunks
 }
 
-func NewDownloader(url string, workers int, chunkSize int64, proxyURL string, bandwidthLimit int64, verbose bool, maxRetries int, retryDelay time.Duration) *Downloader {
+func NewDownloader(url string, workers int, chunkSize int64, proxyURL string, bandwidthLimit int64, verbose bool, maxRetries int, retryDelay time.Duration, memoryLimit int64) *Downloader {
+	// Validate input parameters
+	if workers <= 0 {
+		workers = 1 // Default to 1 worker
+	}
+	if chunkSize <= 0 {
+		chunkSize = defaultChunkSize // Use default chunk size
+	}
+	if memoryLimit < 0 {
+		memoryLimit = 0 // Will use default in parallel download
+	}
+	if maxRetries < 0 {
+		maxRetries = defaultMaxRetries // Use default retries
+	}
+
 	transport := &http.Transport{
 		MaxIdleConns:        1000,
 		MaxIdleConnsPerHost: 1000,
@@ -127,6 +150,8 @@ func NewDownloader(url string, workers int, chunkSize int64, proxyURL string, ba
 		initialDelay:   retryDelay,
 		maxDelay:       defaultMaxDelay,
 		backoffFactor:  defaultBackoffFactor,
+		shutdown:       make(chan struct{}),
+		memoryLimit:    memoryLimit,
 	}
 
 	// Set up rate limiter if bandwidth limit is specified
@@ -245,6 +270,10 @@ func (d *Downloader) getFileSize() error {
 }
 
 func (d *Downloader) downloadChunk(ctx context.Context, start, end int64, writer io.Writer) error {
+	return d.downloadChunkWithProgress(ctx, start, end, writer, nil, 0, 0, time.Time{})
+}
+
+func (d *Downloader) downloadChunkWithProgress(ctx context.Context, start, end int64, writer io.Writer, p *tea.Program, chunkIndex int, workerID int, startTime time.Time) error {
 	return d.retryWithBackoff(ctx, fmt.Sprintf("download chunk %d-%d", start, end), func() error {
 		// Add timeout for individual chunks to prevent hanging
 		chunkCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
@@ -267,7 +296,10 @@ func (d *Downloader) downloadChunk(ctx context.Context, start, end int64, writer
 			return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 		}
 
-		buf := make([]byte, 1024*1024) // 1MB buffer for better performance
+		buf := make([]byte, 256*1024) // 256KB buffer to reduce memory usage
+		var totalRead int64
+		lastProgressTime := time.Now()
+
 		for {
 			n, err := resp.Body.Read(buf)
 			if n > 0 {
@@ -279,7 +311,29 @@ func (d *Downloader) downloadChunk(ctx context.Context, start, end int64, writer
 				if _, werr := writer.Write(buf[:n]); werr != nil {
 					return werr
 				}
-				// Don't update counter here - let parallel_download.go handle it
+
+				totalRead += int64(n)
+
+				// Send progress update every 500ms (always send for speed calculation)
+				if p != nil && time.Since(lastProgressTime) > 500*time.Millisecond {
+					elapsed := time.Since(startTime).Seconds()
+					speed := 0.0
+					if elapsed > 0 {
+						speed = float64(totalRead) / elapsed
+					}
+
+					p.Send(chunkProgressMsg{
+						chunkIndex:      chunkIndex,
+						start:           start,
+						end:             end,
+						status:          "progress",
+						workerID:        workerID,
+						startTime:       startTime,
+						speed:           speed,
+						bytesDownloaded: totalRead,
+					})
+					lastProgressTime = time.Now()
+				}
 			}
 			if err == io.EOF {
 				break
@@ -305,11 +359,14 @@ type downloadCompleteMsg struct{}
 type errorMsg error
 
 type chunkProgressMsg struct {
-	chunkIndex int
-	start      int64
-	end        int64
-	status     string // "started", "completed", "failed"
-	workerID   int
+	chunkIndex      int
+	start           int64
+	end             int64
+	status          string // "started", "completed", "failed", "progress"
+	workerID        int
+	startTime       time.Time
+	speed           float64 // bytes per second
+	bytesDownloaded int64   // bytes downloaded so far for this chunk
 }
 
 func formatBytes(bytes int64) string {
@@ -395,8 +452,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case progressMsg:
 		m.downloaded = msg.downloaded
-		m.speed = msg.speed
 		m.eta = msg.eta
+
+		// Calculate speed from sum of all active chunk speeds (more accurate for parallel downloads)
+		totalChunkSpeed := 0.0
+		for _, chunk := range m.chunkProgress {
+			if chunk.status == "progress" || chunk.status == "started" {
+				totalChunkSpeed += chunk.speed
+			}
+		}
+		// Use chunk-based speed if available, otherwise fallback to message speed
+		if totalChunkSpeed > 0 {
+			m.speed = totalChunkSpeed
+		} else {
+			m.speed = msg.speed
+		}
+
 		if m.total > 0 {
 			m.avgSpeed = float64(m.downloaded) / time.Since(m.startTime).Seconds()
 		}
@@ -408,25 +479,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.GotoBottom()
 
 	case chunkProgressMsg:
+		// Update chunk progress map (for speed calculation and display)
+		m.chunkProgress[msg.chunkIndex] = msg
+
 		if m.verbose {
-			m.chunkProgress[msg.chunkIndex] = msg
-			// Add chunk progress to extracted files for display
-			chunkInfo := fmt.Sprintf("Chunk %d [%s-%s] Worker %d: %s",
-				msg.chunkIndex,
-				formatBytes(msg.start),
-				formatBytes(msg.end),
-				msg.workerID,
-				msg.status)
-			m.extractedFiles = append(m.extractedFiles, chunkInfo)
+			// Only add status changes to extracted files (not progress updates)
+			if msg.status != "progress" {
+				chunkInfo := fmt.Sprintf("Chunk %d [%s-%s] Worker %d: %s",
+					msg.chunkIndex,
+					formatBytes(msg.start),
+					formatBytes(msg.end),
+					msg.workerID,
+					msg.status)
+				m.extractedFiles = append(m.extractedFiles, chunkInfo)
 
-			// Keep only last 100 entries in verbose mode to prevent memory issues
-			if len(m.extractedFiles) > 100 {
-				m.extractedFiles = m.extractedFiles[len(m.extractedFiles)-100:]
+				// Keep only last 100 entries in verbose mode to prevent memory issues
+				if len(m.extractedFiles) > 100 {
+					m.extractedFiles = m.extractedFiles[len(m.extractedFiles)-100:]
+				}
+
+				content := strings.Join(m.extractedFiles, "\n")
+				m.viewport.SetContent(content)
+				m.viewport.GotoBottom()
 			}
-
-			content := strings.Join(m.extractedFiles, "\n")
-			m.viewport.SetContent(content)
-			m.viewport.GotoBottom()
 		}
 
 	case downloadCompleteMsg:
@@ -463,13 +538,23 @@ func (m model) View() string {
 		MarginBottom(1).
 		Render(fmt.Sprintf("📥 Downloading: %s", m.url))
 
-	// Progress bar
-	prog := m.progress.ViewAs(float64(m.downloaded) / float64(m.total))
+	// Progress bar (avoid division by zero)
+	var prog string
+	if m.total > 0 {
+		prog = m.progress.ViewAs(float64(m.downloaded) / float64(m.total))
+	} else {
+		prog = m.progress.ViewAs(0)
+	}
 
-	// Stats
+	// Stats (avoid division by zero)
+	var progressPercent float64
+	if m.total > 0 {
+		progressPercent = float64(m.downloaded) / float64(m.total) * 100
+	}
+
 	statsText := fmt.Sprintf(
 		"Progress: %.1f%% | Downloaded: %s/%s | Speed: %s/s | Avg: %s/s | ETA: %s",
-		float64(m.downloaded)/float64(m.total)*100,
+		progressPercent,
 		formatBytes(m.downloaded),
 		formatBytes(m.total),
 		formatBytes(int64(m.speed)),
@@ -477,25 +562,95 @@ func (m model) View() string {
 		formatDuration(m.eta),
 	)
 
-	// Add chunk progress summary in verbose mode
-	if m.verbose && len(m.chunkProgress) > 0 {
-		activeChunks := 0
-		completedChunks := 0
-		for _, chunk := range m.chunkProgress {
-			switch chunk.status {
-			case "started":
-				activeChunks++
-			case "completed":
-				completedChunks++
-			}
-		}
-		statsText += fmt.Sprintf("\nChunks: %d active, %d completed", activeChunks, completedChunks)
-	}
-
 	stats := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("241")).
 		MarginTop(1).
 		Render(statsText)
+
+	// Build detailed chunk progress view (always show if we have chunks)
+	var chunkDetailsView string
+	if len(m.chunkProgress) > 0 {
+		chunkLines := []string{}
+		activeChunks := 0
+		completedChunks := 0
+		failedChunks := 0
+
+		// Sort chunks by index for consistent display
+		indices := make([]int, 0, len(m.chunkProgress))
+		for idx := range m.chunkProgress {
+			indices = append(indices, idx)
+		}
+
+		// Show only last 10 active chunks to avoid UI overflow
+		displayLimit := 10
+		activeDisplayed := 0
+
+		for _, idx := range indices {
+			chunk := m.chunkProgress[idx]
+
+			// Count chunk statuses
+			switch chunk.status {
+			case "started", "progress":
+				activeChunks++ // Count both started and in-progress chunks as active
+				// Only display active/in-progress chunks up to limit
+				if activeDisplayed < displayLimit {
+					chunkSize := chunk.end - chunk.start + 1
+					elapsed := time.Since(chunk.startTime).Seconds()
+
+					// Display real-time download progress and speed
+					var progressInfo string
+					if chunk.bytesDownloaded > 0 {
+						progressPercent := float64(chunk.bytesDownloaded) / float64(chunkSize) * 100
+						progressInfo = fmt.Sprintf("%.1f%% (%s/%s) @ %s/s",
+							progressPercent,
+							formatBytes(chunk.bytesDownloaded),
+							formatBytes(chunkSize),
+							formatBytes(int64(chunk.speed)))
+					} else {
+						progressInfo = fmt.Sprintf("Starting... (%.1fs elapsed)", elapsed)
+					}
+
+					chunkLines = append(chunkLines, fmt.Sprintf(
+						"  #%-4d [%10s - %10s] Worker %d - %s",
+						chunk.chunkIndex,
+						formatBytes(chunk.start),
+						formatBytes(chunk.end),
+						chunk.workerID,
+						progressInfo,
+					))
+					activeDisplayed++
+				}
+			case "completed":
+				completedChunks++
+			case "failed":
+				failedChunks++
+			}
+		}
+
+		// Build chunk summary header
+		chunkSummary := fmt.Sprintf("Chunks: %d active, %d completed", activeChunks, completedChunks)
+		if failedChunks > 0 {
+			chunkSummary += fmt.Sprintf(", %d failed", failedChunks)
+		}
+		if activeChunks > displayLimit {
+			chunkSummary += fmt.Sprintf(" (showing %d/%d active)", displayLimit, activeChunks)
+		}
+
+		chunkHeader := lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("214")).
+			MarginTop(1).
+			MarginBottom(1).
+			Render(fmt.Sprintf("⚡ %s", chunkSummary))
+
+		if len(chunkLines) > 0 {
+			chunkDetailsView = lipgloss.JoinVertical(
+				lipgloss.Left,
+				chunkHeader,
+				strings.Join(chunkLines, "\n"),
+			)
+		}
+	}
 
 	// Extracted files section
 	filesHeader := lipgloss.NewStyle().
@@ -506,14 +661,15 @@ func (m model) View() string {
 		Render("📂 Extracted Files:")
 
 	// Combine all elements
-	return lipgloss.JoinVertical(
-		lipgloss.Left,
-		header,
-		prog,
-		stats,
-		filesHeader,
-		m.viewport.View(),
-	)
+	elements := []string{header, prog, stats}
+
+	if chunkDetailsView != "" {
+		elements = append(elements, chunkDetailsView)
+	}
+
+	elements = append(elements, filesHeader, m.viewport.View())
+
+	return lipgloss.JoinVertical(lipgloss.Left, elements...)
 }
 
 type archiveType struct {
@@ -691,19 +847,26 @@ func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir str
 		return fmt.Errorf("failed to start tar command: %w", err)
 	}
 
-	// Read tar output
+	// Read tar output with timeout protection
+	scannerDone := make(chan struct{})
 	go func() {
+		defer close(scannerDone)
 		scanner := bufio.NewScanner(io.MultiReader(stdout, stderr))
 		for scanner.Scan() {
-			line := scanner.Text()
-			if line != "" {
-				p.Send(fileExtractedMsg(line))
-				// Track extracted files in state
-				if d.state != nil {
-					d.state.ExtractedFiles = append(d.state.ExtractedFiles, line)
-					// Save state periodically
-					if len(d.state.ExtractedFiles)%50 == 0 {
-						d.saveState()
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				line := scanner.Text()
+				if line != "" {
+					p.Send(fileExtractedMsg(line))
+					// Track extracted files in state
+					if d.state != nil {
+						d.state.ExtractedFiles = append(d.state.ExtractedFiles, line)
+						// Save state periodically
+						if len(d.state.ExtractedFiles)%50 == 0 {
+							d.saveState()
+						}
 					}
 				}
 			}
@@ -761,6 +924,12 @@ func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir str
 	// Sequential download with parallel chunks
 	pipeReader, pipeWriter := io.Pipe()
 
+	// Create a counting writer to track bytes written
+	countingWriter := &countingWriter{
+		writer:     pipeWriter,
+		downloader: d,
+	}
+
 	// Start copying from pipe to tar stdin
 	copyDone := make(chan error, 1)
 	go func() {
@@ -770,7 +939,7 @@ func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir str
 	}()
 
 	// Download chunks
-	downloadErr := d.downloadInOrderParallel(ctx, pipeWriter, p)
+	downloadErr := d.downloadInOrderParallel(ctx, countingWriter, p)
 	pipeWriter.Close()
 
 	// Wait for copy to complete
@@ -862,7 +1031,8 @@ func parseMemoryLimit(limit string, workers int) int64 {
 // Generate state filename from URL
 func getStateFilename(url string) string {
 	h := sha256.Sum256([]byte(url))
-	return filepath.Join(os.TempDir(), fmt.Sprintf("marianne-state-%s.json", hex.EncodeToString(h[:8])))
+	// Create state file in current directory for easy access
+	return fmt.Sprintf(".marianne-state-%s.json", hex.EncodeToString(h[:8]))
 }
 
 // Save download state
@@ -879,6 +1049,7 @@ func (d *Downloader) saveState() error {
 	}
 
 	d.state.Downloaded = d.downloaded.Load()
+	d.state.BytePosition = d.bytePosition.Load()
 	d.state.Updated = time.Now()
 
 	data, err := json.MarshalIndent(d.state, "", "  ")
@@ -887,6 +1058,46 @@ func (d *Downloader) saveState() error {
 	}
 
 	return os.WriteFile(d.stateFile, data, 0644)
+}
+
+// GracefulShutdown handles SIGTERM signal and saves state properly
+// Uses sync.Once to ensure it can only be called once, preventing panics from double-closing channels
+func (d *Downloader) GracefulShutdown() error {
+	var shutdownErr error
+
+	d.shutdownOnce.Do(func() {
+		// Flush write buffer if it exists
+		if d.writeBuffer != nil {
+			if err := d.writeBuffer.Flush(); err != nil {
+				shutdownErr = fmt.Errorf("failed to flush write buffer: %w", err)
+				return
+			}
+		}
+
+		// Sync file to disk
+		if d.currentFile != nil {
+			if err := d.currentFile.Sync(); err != nil {
+				shutdownErr = fmt.Errorf("failed to sync file: %w", err)
+				return
+			}
+
+			// Get exact file position after flush
+			pos, err := d.currentFile.Seek(0, io.SeekCurrent)
+			if err == nil {
+				d.bytePosition.Store(pos)
+			}
+		}
+
+		// Save state with exact byte position
+		if err := d.saveState(); err != nil {
+			shutdownErr = fmt.Errorf("failed to save state: %w", err)
+			return
+		}
+
+		close(d.shutdown)
+	})
+
+	return shutdownErr
 }
 
 // Load download state
@@ -933,6 +1144,7 @@ func (d *Downloader) downloadAndExtractZip(ctx context.Context, p *tea.Program, 
 				tmpFile, err = os.OpenFile(d.resumeFile, os.O_RDWR, 0644)
 				if err == nil {
 					d.downloaded.Store(existingSize)
+					d.bytePosition.Store(existingSize)
 					p.Send(progressMsg{
 						downloaded: existingSize,
 						total:      d.totalSize,
@@ -953,6 +1165,12 @@ func (d *Downloader) downloadAndExtractZip(ctx context.Context, p *tea.Program, 
 		}
 	}
 
+	// Check if we have a saved byte position from state
+	if resume && d.state != nil && d.state.BytePosition > 0 {
+		existingSize = d.state.BytePosition
+		d.bytePosition.Store(existingSize)
+	}
+
 	// If not resuming or resume failed, create new temp file
 	if tmpFile == nil {
 		tmpFile, err = os.CreateTemp("", "marianne-*.zip")
@@ -963,8 +1181,12 @@ func (d *Downloader) downloadAndExtractZip(ctx context.Context, p *tea.Program, 
 		existingSize = 0
 	}
 
+	// Track the file for graceful shutdown
+	d.currentFile = tmpFile
+
 	defer func() {
 		tmpFile.Close()
+		d.currentFile = nil
 		if !resume {
 			os.Remove(tmpFile.Name())
 		}
@@ -1031,6 +1253,26 @@ func (d *Downloader) downloadAndExtractZip(ctx context.Context, p *tea.Program, 
 	return d.extractZipFile(tmpFile.Name(), outputDir, p)
 }
 
+// validateZipPath checks if a zip entry path is safe (no path traversal)
+func validateZipPath(path string) error {
+	// Check for path traversal attempts
+	if strings.Contains(path, "..") {
+		return fmt.Errorf("path contains '..': %s", path)
+	}
+
+	// Check for absolute paths
+	if filepath.IsAbs(path) {
+		return fmt.Errorf("path is absolute: %s", path)
+	}
+
+	// Check for backslashes (Windows path separators used maliciously on Unix)
+	if strings.Contains(path, "\\") {
+		return fmt.Errorf("path contains backslash: %s", path)
+	}
+
+	return nil
+}
+
 func (d *Downloader) extractZipFile(filename string, outputDir string, p *tea.Program) error {
 	reader, err := zip.OpenReader(filename)
 	if err != nil {
@@ -1040,7 +1282,25 @@ func (d *Downloader) extractZipFile(filename string, outputDir string, p *tea.Pr
 
 	// Extract files
 	for _, file := range reader.File {
+		// Validate file path to prevent path traversal attacks
+		if err := validateZipPath(file.Name); err != nil {
+			return fmt.Errorf("invalid file path in zip: %w", err)
+		}
+
 		path := filepath.Join(outputDir, file.Name)
+
+		// Double-check that the resolved path is within outputDir
+		absPath, err := filepath.Abs(path)
+		if err != nil {
+			return fmt.Errorf("failed to resolve path: %w", err)
+		}
+		absOutputDir, err := filepath.Abs(outputDir)
+		if err != nil {
+			return fmt.Errorf("failed to resolve output dir: %w", err)
+		}
+		if !strings.HasPrefix(absPath, absOutputDir+string(filepath.Separator)) && absPath != absOutputDir {
+			return fmt.Errorf("invalid file path (path traversal attempt): %s", file.Name)
+		}
 
 		// Send file extraction message
 		p.Send(fileExtractedMsg(file.Name))
@@ -1055,20 +1315,22 @@ func (d *Downloader) extractZipFile(filename string, outputDir string, p *tea.Pr
 			return err
 		}
 
-		// Extract file
+		// Extract file (close files immediately to avoid FD leak in large archives)
 		fileReader, err := file.Open()
 		if err != nil {
 			return err
 		}
-		defer fileReader.Close()
 
 		targetFile, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, file.Mode())
 		if err != nil {
+			fileReader.Close()
 			return err
 		}
-		defer targetFile.Close()
 
 		_, err = io.Copy(targetFile, fileReader)
+		fileReader.Close()
+		targetFile.Close()
+
 		if err != nil {
 			return err
 		}
@@ -1087,8 +1349,12 @@ func (d *Downloader) downloadToFileWithResume(ctx context.Context, file *os.File
 	}
 
 	// Use buffered writer for better disk I/O performance
-	bufWriter := bufio.NewWriterSize(file, 16*1024*1024) // 16MB buffer
-	defer bufWriter.Flush()
+	bufWriter := bufio.NewWriterSize(file, 4*1024*1024) // 4MB buffer to reduce memory usage
+	d.writeBuffer = bufWriter // Track buffer for graceful shutdown
+	defer func() {
+		bufWriter.Flush()
+		d.writeBuffer = nil
+	}()
 
 	return d.retryWithBackoff(ctx, "download file", func() error {
 		// Download entire file or remaining part
@@ -1158,6 +1424,21 @@ func (r *rateLimitedReader) Read(p []byte) (int, error) {
 	if n > 0 {
 		r.limiter.WaitN(r.ctx, n)
 		r.downloader.downloaded.Add(int64(n))
+		r.downloader.bytePosition.Add(int64(n))
+	}
+	return n, err
+}
+
+// countingWriter tracks bytes written for TAR downloads
+type countingWriter struct {
+	writer     io.Writer
+	downloader *Downloader
+}
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	n, err := w.writer.Write(p)
+	if n > 0 {
+		w.downloader.bytePosition.Add(int64(n))
 	}
 	return n, err
 }
@@ -1237,7 +1518,7 @@ func main() {
 		fmt.Printf("Memory limit: %s (chunk size: %s)\n", formatBytes(memBytes), formatBytes(*chunkSize))
 	}
 
-	downloader := NewDownloader(url, *workers, *chunkSize, *proxyURL, limitBytes, *verbose, *maxRetries, *retryDelay)
+	downloader := NewDownloader(url, *workers, *chunkSize, *proxyURL, limitBytes, *verbose, *maxRetries, *retryDelay, memBytes)
 
 	// Get file size first
 	if err := downloader.getFileSize(); err != nil {
@@ -1255,10 +1536,30 @@ func main() {
 				fmt.Sprintf("Resume state found at: %s", stateFile))
 		}
 	}
-	p := tea.NewProgram(model)
+
+	// Check if we're running in a TTY (interactive terminal)
+	// If not (e.g., piped output, background, CI/CD), use headless mode
+	var p *tea.Program
+	if term.IsTerminal(int(os.Stdout.Fd())) {
+		// Interactive mode with full TUI
+		p = tea.NewProgram(model)
+	} else {
+		// Non-interactive mode - disable TUI to avoid /dev/tty errors
+		p = tea.NewProgram(model,
+			tea.WithInput(nil),
+			tea.WithoutRenderer(),
+		)
+	}
+
+	// Set up signal handler for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
+
+	// Create context that can be cancelled
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	// Run download in background
-	ctx := context.Background()
 	errChan := make(chan error, 1)
 	go func() {
 		if err := downloader.Download(ctx, p, *outputDir, *resume); err != nil {
@@ -1269,6 +1570,27 @@ func main() {
 		}
 	}()
 
+	// Handle signals in background
+	go func() {
+		sig := <-sigChan
+		fmt.Fprintf(os.Stderr, "\nReceived signal %v, saving state and shutting down...\n", sig)
+		
+		// Cancel context to stop download
+		cancel()
+		
+		// Save state and flush buffers
+		if err := downloader.GracefulShutdown(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error during graceful shutdown: %v\n", err)
+		} else {
+			stateFile := getStateFilename(url)
+			fmt.Fprintf(os.Stderr, "State saved to: %s\n", stateFile)
+			fmt.Fprintf(os.Stderr, "Resume with: marianne -resume %s\n", url)
+		}
+		
+		// Quit the TUI
+		p.Quit()
+	}()
+
 	// Run TUI
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error running TUI: %v\n", err)
@@ -1276,7 +1598,12 @@ func main() {
 	}
 
 	// Check for download errors
-	if err := <-errChan; err != nil {
-		os.Exit(1)
+	select {
+	case err := <-errChan:
+		if err != nil && err != context.Canceled {
+			os.Exit(1)
+		}
+	default:
+		// Download may have been interrupted by signal
 	}
 }

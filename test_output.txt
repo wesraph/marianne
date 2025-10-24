@@ -1,0 +1,358 @@
+=== RUN   TestExtractZipFilePathTraversal
+    archive_test.go:16: Requires TUI modification to accept nil program for testing
+--- SKIP: TestExtractZipFilePathTraversal (0.00s)
+=== RUN   TestExtractZipFileBasic
+    archive_test.go:168: ZIP extraction requires TUI program which can't be easily mocked
+--- SKIP: TestExtractZipFileBasic (0.00s)
+=== RUN   TestExtractZipFileLarge
+    archive_test.go:195: Skipping large ZIP test - would create 1000+ files
+--- SKIP: TestExtractZipFileLarge (0.00s)
+=== RUN   TestGetFileSize
+--- PASS: TestGetFileSize (0.00s)
+=== RUN   TestGetFileSizeRetry
+--- PASS: TestGetFileSizeRetry (0.15s)
+=== RUN   TestGetFileSizeExhaustedRetries
+--- PASS: TestGetFileSizeExhaustedRetries (0.35s)
+=== RUN   TestGetFileSizeInvalidSize
+    downloader_test.go:88: Requires mock server enhancement to return invalid headers
+--- SKIP: TestGetFileSizeInvalidSize (0.00s)
+=== RUN   TestDownloadChunk
+--- PASS: TestDownloadChunk (0.00s)
+=== RUN   TestDownloadChunkMiddle
+--- PASS: TestDownloadChunkMiddle (0.00s)
+=== RUN   TestDownloadChunkRetry
+--- PASS: TestDownloadChunkRetry (0.15s)
+=== RUN   TestDownloadChunkTimeout
+    downloader_test.go:170: Chunk timeout is hard-coded to 5 minutes, making test too slow
+--- SKIP: TestDownloadChunkTimeout (0.00s)
+=== RUN   TestDownloadChunkCancellation
+--- PASS: TestDownloadChunkCancellation (0.00s)
+=== RUN   TestDownloadChunkBoundary
+--- PASS: TestDownloadChunkBoundary (0.00s)
+=== RUN   TestDownloadChunkServerNoRangeSupport
+--- PASS: TestDownloadChunkServerNoRangeSupport (0.00s)
+=== RUN   TestRetryWithBackoffSuccess
+--- PASS: TestRetryWithBackoffSuccess (0.00s)
+=== RUN   TestRetryWithBackoffEventualSuccess
+--- PASS: TestRetryWithBackoffEventualSuccess (0.15s)
+=== RUN   TestRetryWithBackoffAllFail
+--- PASS: TestRetryWithBackoffAllFail (0.35s)
+=== RUN   TestRetryWithBackoffCancellation
+--- PASS: TestRetryWithBackoffCancellation (0.15s)
+=== RUN   TestRateLimitedReader
+    downloader_test.go:394: Download time: 753.697µs (rate limiting may not have kicked in due to burst)
+--- PASS: TestRateLimitedReader (0.00s)
+=== RUN   TestFormatBytes
+=== RUN   TestFormatBytes/Zero_bytes
+=== RUN   TestFormatBytes/Bytes
+=== RUN   TestFormatBytes/Kilobytes
+=== RUN   TestFormatBytes/Megabytes
+=== RUN   TestFormatBytes/Gigabytes
+=== RUN   TestFormatBytes/Terabytes
+=== RUN   TestFormatBytes/Petabytes
+=== RUN   TestFormatBytes/Exabytes
+=== RUN   TestFormatBytes/Complex_KB
+=== RUN   TestFormatBytes/Complex_MB
+=== RUN   TestFormatBytes/Large_value
+--- PASS: TestFormatBytes (0.00s)
+    --- PASS: TestFormatBytes/Zero_bytes (0.00s)
+    --- PASS: TestFormatBytes/Bytes (0.00s)
+    --- PASS: TestFormatBytes/Kilobytes (0.00s)
+    --- PASS: TestFormatBytes/Megabytes (0.00s)
+    --- PASS: TestFormatBytes/Gigabytes (0.00s)
+    --- PASS: TestFormatBytes/Terabytes (0.00s)
+    --- PASS: TestFormatBytes/Petabytes (0.00s)
+    --- PASS: TestFormatBytes/Exabytes (0.00s)
+    --- PASS: TestFormatBytes/Complex_KB (0.00s)
+    --- PASS: TestFormatBytes/Complex_MB (0.00s)
+    --- PASS: TestFormatBytes/Large_value (0.00s)
+=== RUN   TestFormatDuration
+=== RUN   TestFormatDuration/Zero
+=== RUN   TestFormatDuration/Seconds
+=== RUN   TestFormatDuration/One_minute
+=== RUN   TestFormatDuration/Minutes_and_seconds
+=== RUN   TestFormatDuration/One_hour
+=== RUN   TestFormatDuration/Hours_and_minutes
+=== RUN   TestFormatDuration/Multiple_hours
+=== RUN   TestFormatDuration/Less_than_second
+--- PASS: TestFormatDuration (0.00s)
+    --- PASS: TestFormatDuration/Zero (0.00s)
+    --- PASS: TestFormatDuration/Seconds (0.00s)
+    --- PASS: TestFormatDuration/One_minute (0.00s)
+    --- PASS: TestFormatDuration/Minutes_and_seconds (0.00s)
+    --- PASS: TestFormatDuration/One_hour (0.00s)
+    --- PASS: TestFormatDuration/Hours_and_minutes (0.00s)
+    --- PASS: TestFormatDuration/Multiple_hours (0.00s)
+    --- PASS: TestFormatDuration/Less_than_second (0.00s)
+=== RUN   TestParseBandwidthLimit
+=== RUN   TestParseBandwidthLimit/Empty_string
+=== RUN   TestParseBandwidthLimit/Just_number
+=== RUN   TestParseBandwidthLimit/Kilobytes
+=== RUN   TestParseBandwidthLimit/Kilobytes_lowercase
+=== RUN   TestParseBandwidthLimit/Megabytes
+=== RUN   TestParseBandwidthLimit/Megabytes_lowercase
+=== RUN   TestParseBandwidthLimit/Gigabytes
+=== RUN   TestParseBandwidthLimit/Gigabytes_lowercase
+=== RUN   TestParseBandwidthLimit/Decimal_KB
+=== RUN   TestParseBandwidthLimit/Decimal_MB
+=== RUN   TestParseBandwidthLimit/Whitespace
+=== RUN   TestParseBandwidthLimit/Invalid_format
+=== RUN   TestParseBandwidthLimit/Negative
+--- PASS: TestParseBandwidthLimit (0.00s)
+    --- PASS: TestParseBandwidthLimit/Empty_string (0.00s)
+    --- PASS: TestParseBandwidthLimit/Just_number (0.00s)
+    --- PASS: TestParseBandwidthLimit/Kilobytes (0.00s)
+    --- PASS: TestParseBandwidthLimit/Kilobytes_lowercase (0.00s)
+    --- PASS: TestParseBandwidthLimit/Megabytes (0.00s)
+    --- PASS: TestParseBandwidthLimit/Megabytes_lowercase (0.00s)
+    --- PASS: TestParseBandwidthLimit/Gigabytes (0.00s)
+    --- PASS: TestParseBandwidthLimit/Gigabytes_lowercase (0.00s)
+    --- PASS: TestParseBandwidthLimit/Decimal_KB (0.00s)
+    --- PASS: TestParseBandwidthLimit/Decimal_MB (0.00s)
+    --- PASS: TestParseBandwidthLimit/Whitespace (0.00s)
+    --- PASS: TestParseBandwidthLimit/Invalid_format (0.00s)
+    --- PASS: TestParseBandwidthLimit/Negative (0.00s)
+=== RUN   TestParseMemoryLimit
+=== RUN   TestParseMemoryLimit/Auto
+=== RUN   TestParseMemoryLimit/Explicit_MB
+=== RUN   TestParseMemoryLimit/Explicit_GB
+--- PASS: TestParseMemoryLimit (0.00s)
+    --- PASS: TestParseMemoryLimit/Auto (0.00s)
+    --- PASS: TestParseMemoryLimit/Explicit_MB (0.00s)
+    --- PASS: TestParseMemoryLimit/Explicit_GB (0.00s)
+=== RUN   TestDetectArchiveType
+=== RUN   TestDetectArchiveType/ZIP_file
+=== RUN   TestDetectArchiveType/ZIP_uppercase
+=== RUN   TestDetectArchiveType/TAR
+=== RUN   TestDetectArchiveType/TAR.GZ
+=== RUN   TestDetectArchiveType/TGZ
+=== RUN   TestDetectArchiveType/TAR.BZ2
+=== RUN   TestDetectArchiveType/TBZ2
+=== RUN   TestDetectArchiveType/TAR.XZ
+=== RUN   TestDetectArchiveType/TXZ
+=== RUN   TestDetectArchiveType/TAR.LZ4
+=== RUN   TestDetectArchiveType/TAR.ZST
+=== RUN   TestDetectArchiveType/TAR.ZSTD
+=== RUN   TestDetectArchiveType/TAR.LZMA
+=== RUN   TestDetectArchiveType/Unsupported_7z
+=== RUN   TestDetectArchiveType/Unsupported_RAR
+=== RUN   TestDetectArchiveType/Unknown_extension
+=== RUN   TestDetectArchiveType/No_extension
+--- PASS: TestDetectArchiveType (0.00s)
+    --- PASS: TestDetectArchiveType/ZIP_file (0.00s)
+    --- PASS: TestDetectArchiveType/ZIP_uppercase (0.00s)
+    --- PASS: TestDetectArchiveType/TAR (0.00s)
+    --- PASS: TestDetectArchiveType/TAR.GZ (0.00s)
+    --- PASS: TestDetectArchiveType/TGZ (0.00s)
+    --- PASS: TestDetectArchiveType/TAR.BZ2 (0.00s)
+    --- PASS: TestDetectArchiveType/TBZ2 (0.00s)
+    --- PASS: TestDetectArchiveType/TAR.XZ (0.00s)
+    --- PASS: TestDetectArchiveType/TXZ (0.00s)
+    --- PASS: TestDetectArchiveType/TAR.LZ4 (0.00s)
+    --- PASS: TestDetectArchiveType/TAR.ZST (0.00s)
+    --- PASS: TestDetectArchiveType/TAR.ZSTD (0.00s)
+    --- PASS: TestDetectArchiveType/TAR.LZMA (0.00s)
+    --- PASS: TestDetectArchiveType/Unsupported_7z (0.00s)
+    --- PASS: TestDetectArchiveType/Unsupported_RAR (0.00s)
+    --- PASS: TestDetectArchiveType/Unknown_extension (0.00s)
+    --- PASS: TestDetectArchiveType/No_extension (0.00s)
+=== RUN   TestGetStateFilename
+=== RUN   TestGetStateFilename/Simple_URL
+=== RUN   TestGetStateFilename/Complex_URL
+=== RUN   TestGetStateFilename/Different_URL
+=== RUN   TestGetStateFilename/Different_URLs_should_produce_different_filenames
+--- PASS: TestGetStateFilename (0.00s)
+    --- PASS: TestGetStateFilename/Simple_URL (0.00s)
+    --- PASS: TestGetStateFilename/Complex_URL (0.00s)
+    --- PASS: TestGetStateFilename/Different_URL (0.00s)
+    --- PASS: TestGetStateFilename/Different_URLs_should_produce_different_filenames (0.00s)
+=== RUN   TestNewDownloader
+=== RUN   TestNewDownloader/Default_configuration
+=== RUN   TestNewDownloader/With_proxy
+=== RUN   TestNewDownloader/With_bandwidth_limit
+--- PASS: TestNewDownloader (0.00s)
+    --- PASS: TestNewDownloader/Default_configuration (0.00s)
+    --- PASS: TestNewDownloader/With_proxy (0.00s)
+    --- PASS: TestNewDownloader/With_bandwidth_limit (0.00s)
+=== RUN   TestGetSystemMemory
+--- PASS: TestGetSystemMemory (0.00s)
+=== RUN   TestFormatBytesEdgeCases
+=== RUN   TestFormatBytesEdgeCases/Negative_bytes
+    marianne_test.go:412: formatBytes(-1024) = -1024 B
+=== RUN   TestFormatBytesEdgeCases/Max_int64
+    marianne_test.go:412: formatBytes(9223372036854775807) = 8.0 EB
+=== RUN   TestFormatBytesEdgeCases/One_less_than_KB
+    marianne_test.go:412: formatBytes(1023) = 1023 B
+=== RUN   TestFormatBytesEdgeCases/Exactly_1KB
+    marianne_test.go:412: formatBytes(1024) = 1.0 KB
+--- PASS: TestFormatBytesEdgeCases (0.00s)
+    --- PASS: TestFormatBytesEdgeCases/Negative_bytes (0.00s)
+    --- PASS: TestFormatBytesEdgeCases/Max_int64 (0.00s)
+    --- PASS: TestFormatBytesEdgeCases/One_less_than_KB (0.00s)
+    --- PASS: TestFormatBytesEdgeCases/Exactly_1KB (0.00s)
+=== RUN   TestParseBandwidthLimitPrecision
+=== RUN   TestParseBandwidthLimitPrecision/Large_decimal_KB
+    marianne_test.go:437: parseBandwidthLimit("999999.99K") = 1023999989
+=== RUN   TestParseBandwidthLimitPrecision/Large_decimal_MB
+    marianne_test.go:437: parseBandwidthLimit("999999.99M") = 1048575989514
+=== RUN   TestParseBandwidthLimitPrecision/Small_decimal
+    marianne_test.go:437: parseBandwidthLimit("0.001M") = 1048
+=== RUN   TestParseBandwidthLimitPrecision/Very_large
+    marianne_test.go:437: parseBandwidthLimit("999999G") = 1073740750258176
+--- PASS: TestParseBandwidthLimitPrecision (0.00s)
+    --- PASS: TestParseBandwidthLimitPrecision/Large_decimal_KB (0.00s)
+    --- PASS: TestParseBandwidthLimitPrecision/Large_decimal_MB (0.00s)
+    --- PASS: TestParseBandwidthLimitPrecision/Small_decimal (0.00s)
+    --- PASS: TestParseBandwidthLimitPrecision/Very_large (0.00s)
+=== RUN   TestSaveState
+--- PASS: TestSaveState (0.00s)
+=== RUN   TestLoadState
+--- PASS: TestLoadState (0.00s)
+=== RUN   TestLoadStateURLMismatch
+--- PASS: TestLoadStateURLMismatch (0.00s)
+=== RUN   TestLoadStateInvalidJSON
+--- PASS: TestLoadStateInvalidJSON (0.00s)
+=== RUN   TestLoadStateNonExistent
+--- PASS: TestLoadStateNonExistent (0.00s)
+=== RUN   TestCleanupState
+--- PASS: TestCleanupState (0.00s)
+=== RUN   TestGracefulShutdown
+--- PASS: TestGracefulShutdown (0.00s)
+=== RUN   TestGracefulShutdownWithoutFile
+--- PASS: TestGracefulShutdownWithoutFile (0.00s)
+=== RUN   TestStateRace
+--- PASS: TestStateRace (0.00s)
+=== RUN   TestStateUpdateTracking
+--- PASS: TestStateUpdateTracking (0.10s)
+=== RUN   TestStateWithExtractedFiles
+--- PASS: TestStateWithExtractedFiles (0.00s)
+=== RUN   TestStateWithETag
+--- PASS: TestStateWithETag (0.00s)
+=== RUN   TestGracefulShutdownTwice
+--- PASS: TestGracefulShutdownTwice (0.00s)
+=== RUN   TestWorkerCountValidation
+=== RUN   TestWorkerCountValidation/Valid_workers
+=== RUN   TestWorkerCountValidation/Single_worker
+=== RUN   TestWorkerCountValidation/Zero_workers_-_BUG:_should_error
+    validation_test.go:30: BUG: Worker count 0 should be validated but was allowed
+=== RUN   TestWorkerCountValidation/Negative_workers_-_BUG:_should_error
+    validation_test.go:30: BUG: Worker count -1 should be validated but was allowed
+=== RUN   TestWorkerCountValidation/Large_workers
+--- PASS: TestWorkerCountValidation (0.00s)
+    --- PASS: TestWorkerCountValidation/Valid_workers (0.00s)
+    --- PASS: TestWorkerCountValidation/Single_worker (0.00s)
+    --- PASS: TestWorkerCountValidation/Zero_workers_-_BUG:_should_error (0.00s)
+    --- PASS: TestWorkerCountValidation/Negative_workers_-_BUG:_should_error (0.00s)
+    --- PASS: TestWorkerCountValidation/Large_workers (0.00s)
+=== RUN   TestChunkSizeValidation
+=== RUN   TestChunkSizeValidation/Valid_chunk_size
+=== RUN   TestChunkSizeValidation/Small_chunk
+=== RUN   TestChunkSizeValidation/Zero_chunk_-_BUG:_should_error
+    validation_test.go:60: BUG: Chunk size 0 should be validated but was allowed
+=== RUN   TestChunkSizeValidation/Negative_chunk_-_BUG:_should_error
+    validation_test.go:60: BUG: Chunk size -1024 should be validated but was allowed
+=== RUN   TestChunkSizeValidation/Very_large_chunk
+--- PASS: TestChunkSizeValidation (0.00s)
+    --- PASS: TestChunkSizeValidation/Valid_chunk_size (0.00s)
+    --- PASS: TestChunkSizeValidation/Small_chunk (0.00s)
+    --- PASS: TestChunkSizeValidation/Zero_chunk_-_BUG:_should_error (0.00s)
+    --- PASS: TestChunkSizeValidation/Negative_chunk_-_BUG:_should_error (0.00s)
+    --- PASS: TestChunkSizeValidation/Very_large_chunk (0.00s)
+=== RUN   TestMemoryLimitValidation
+=== RUN   TestMemoryLimitValidation/Valid_memory_limit
+=== RUN   TestMemoryLimitValidation/Auto_memory
+=== RUN   TestMemoryLimitValidation/Invalid_format_-_BUG
+    validation_test.go:90: BUG: Result for "invalid": 0 (should validate invalid input)
+=== RUN   TestMemoryLimitValidation/Negative_-_BUG
+    validation_test.go:90: BUG: Result for "-100M": -104857600 (should validate invalid input)
+    validation_test.go:95: BUG: Memory limit is negative: -104857600 (should be validated)
+=== RUN   TestMemoryLimitValidation/Zero
+=== RUN   TestMemoryLimitValidation/Empty_string
+--- PASS: TestMemoryLimitValidation (0.00s)
+    --- PASS: TestMemoryLimitValidation/Valid_memory_limit (0.00s)
+    --- PASS: TestMemoryLimitValidation/Auto_memory (0.00s)
+    --- PASS: TestMemoryLimitValidation/Invalid_format_-_BUG (0.00s)
+    --- PASS: TestMemoryLimitValidation/Negative_-_BUG (0.00s)
+    --- PASS: TestMemoryLimitValidation/Zero (0.00s)
+    --- PASS: TestMemoryLimitValidation/Empty_string (0.00s)
+=== RUN   TestProxyURLValidation
+=== RUN   TestProxyURLValidation/Valid_proxy
+=== RUN   TestProxyURLValidation/Valid_with_auth
+=== RUN   TestProxyURLValidation/Invalid_URL_-_BUG:_silently_ignored
+=== RUN   TestProxyURLValidation/Empty
+=== RUN   TestProxyURLValidation/Malformed_-_BUG
+--- PASS: TestProxyURLValidation (0.00s)
+    --- PASS: TestProxyURLValidation/Valid_proxy (0.00s)
+    --- PASS: TestProxyURLValidation/Valid_with_auth (0.00s)
+    --- PASS: TestProxyURLValidation/Invalid_URL_-_BUG:_silently_ignored (0.00s)
+    --- PASS: TestProxyURLValidation/Empty (0.00s)
+    --- PASS: TestProxyURLValidation/Malformed_-_BUG (0.00s)
+=== RUN   TestNegativeContentLength
+    validation_test.go:135: Requires mock server to return negative Content-Length header
+--- SKIP: TestNegativeContentLength (0.00s)
+=== RUN   TestZeroContentLength
+    validation_test.go:157: BUG: Zero total size could cause division by zero in TUI progress calculation
+--- PASS: TestZeroContentLength (0.00s)
+=== RUN   TestTUIDimensionUnderflow
+=== RUN   TestTUIDimensionUnderflow/Normal_dimensions
+=== RUN   TestTUIDimensionUnderflow/Minimum_safe
+    validation_test.go:205: BUG: Small dimensions 10x10 could cause underflow (width-4=6, height-12=-2)
+=== RUN   TestTUIDimensionUnderflow/Very_small_width_-_potential_underflow
+    validation_test.go:205: BUG: Small dimensions 3x24 could cause underflow (width-4=-1, height-12=12)
+=== RUN   TestTUIDimensionUnderflow/Very_small_height
+    validation_test.go:205: BUG: Small dimensions 80x3 could cause underflow (width-4=76, height-12=-9)
+=== RUN   TestTUIDimensionUnderflow/Both_very_small
+    validation_test.go:205: BUG: Small dimensions 2x2 could cause underflow (width-4=-2, height-12=-10)
+=== RUN   TestTUIDimensionUnderflow/Zero_width_-_BUG
+    validation_test.go:205: BUG: Small dimensions 0x24 could cause underflow (width-4=-4, height-12=12)
+=== RUN   TestTUIDimensionUnderflow/Zero_height_-_BUG
+    validation_test.go:205: BUG: Small dimensions 80x0 could cause underflow (width-4=76, height-12=-12)
+--- PASS: TestTUIDimensionUnderflow (0.00s)
+    --- PASS: TestTUIDimensionUnderflow/Normal_dimensions (0.00s)
+    --- PASS: TestTUIDimensionUnderflow/Minimum_safe (0.00s)
+    --- PASS: TestTUIDimensionUnderflow/Very_small_width_-_potential_underflow (0.00s)
+    --- PASS: TestTUIDimensionUnderflow/Very_small_height (0.00s)
+    --- PASS: TestTUIDimensionUnderflow/Both_very_small (0.00s)
+    --- PASS: TestTUIDimensionUnderflow/Zero_width_-_BUG (0.00s)
+    --- PASS: TestTUIDimensionUnderflow/Zero_height_-_BUG (0.00s)
+=== RUN   TestDivisionByZeroInTUI
+    validation_test.go:244: BUG: Division by zero in progress calculation (marianne.go:476) - should validate m.total != 0
+--- PASS: TestDivisionByZeroInTUI (0.00s)
+=== RUN   TestRetryDelayOverflow
+panic: test timed out after 30s
+	running tests:
+		TestRetryDelayOverflow (29s)
+
+goroutine 322 [running]:
+testing.(*M).startAlarm.func1()
+	/usr/lib/go/src/testing/testing.go:2682 +0x345
+created by time.goFunc
+	/usr/lib/go/src/time/sleep.go:215 +0x2d
+
+goroutine 1 [chan receive]:
+testing.(*T).Run(0xc0001941c0, {0x83cc16?, 0xc00008fb30?}, 0x85a088)
+	/usr/lib/go/src/testing/testing.go:2005 +0x485
+testing.runTests.func1(0xc0001941c0)
+	/usr/lib/go/src/testing/testing.go:2477 +0x37
+testing.tRunner(0xc0001941c0, 0xc00008fc70)
+	/usr/lib/go/src/testing/testing.go:1934 +0xea
+testing.runTests(0xc000012390, {0xb8ada0, 0x38, 0x38}, {0x7?, 0xc000016c80?, 0xb92960?})
+	/usr/lib/go/src/testing/testing.go:2475 +0x4b4
+testing.(*M).Run(0xc0000bd040)
+	/usr/lib/go/src/testing/testing.go:2337 +0x63a
+main.main()
+	_testmain.go:155 +0x9b
+
+goroutine 309 [sleep]:
+time.Sleep(0x34630b8a000)
+	/usr/lib/go/src/runtime/time.go:363 +0x165
+github.com/wesraph/marianne.(*Downloader).retryWithBackoff(0xc00028c380, {0x0, 0x0}, {0x838696, 0xe}, 0xc00007d748)
+	/home/raph/sources/marianne/marianne.go:194 +0x2c5
+github.com/wesraph/marianne.TestRetryDelayOverflow(0xc000295180)
+	/home/raph/sources/marianne/validation_test.go:255 +0xaa
+testing.tRunner(0xc000295180, 0x85a088)
+	/usr/lib/go/src/testing/testing.go:1934 +0xea
+created by testing.(*T).Run in goroutine 1
+	/usr/lib/go/src/testing/testing.go:1997 +0x465
+exit status 2
+FAIL	github.com/wesraph/marianne	30.006s

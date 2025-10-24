@@ -25,14 +25,33 @@ func (d *Downloader) downloadInOrderParallel(ctx context.Context, writer io.Writ
 		err   error
 	}
 	
-	// Limit memory usage - max chunks in flight
-	maxChunksInMemory := 32 // At 5MB per chunk, this is ~160MB max
+	// Calculate memory limits based on configured memory limit
+	memoryLimit := d.memoryLimit
+	if memoryLimit <= 0 {
+		// Default to 1GB if not set
+		memoryLimit = 1024 * 1024 * 1024
+	}
+	
+	// Calculate max chunks that can fit in memory
+	// Reserve 20% for other overhead
+	usableMemory := int64(float64(memoryLimit) * 0.8)
+	maxChunksInMemory := int(usableMemory / d.chunkSize)
+	if maxChunksInMemory < d.workers*2 {
+		// Ensure at least 2 chunks per worker
+		maxChunksInMemory = d.workers * 2
+	}
+	if maxChunksInMemory > 64 {
+		// Cap at 64 to prevent excessive buffering
+		maxChunksInMemory = 64
+	}
 	
 	// Track chunks that have been queued
 	queuedChunks := 0
-	
+
 	// Channels for coordination with backpressure
-	downloadQueue := make(chan chunkInfo, d.workers) // Only queue as many as workers
+	downloadQueue := make(chan chunkInfo, d.workers*2) // Queue for workers
+	// Large buffer to prevent worker blocking when chunks arrive out of order
+	// This prevents deadlock where workers block on send while writer waits for next chunk
 	resultChan := make(chan chunkInfo, maxChunksInMemory)
 	
 	// Start download workers
@@ -43,42 +62,58 @@ func (d *Downloader) downloadInOrderParallel(ctx context.Context, writer io.Writ
 			defer downloadWg.Done()
 			
 			for chunk := range downloadQueue {
+				startTime := time.Now()
+
 				// Send progress message if verbose
-				if d.verbose && p != nil {
+				if p != nil {
 					p.Send(chunkProgressMsg{
 						chunkIndex: chunk.index,
 						start:      chunk.start,
 						end:        chunk.end,
 						status:     "started",
 						workerID:   workerID,
+						startTime:  startTime,
 					})
 				}
-				
+
 				// Download the chunk
 				var buf bytes.Buffer
-				if err := d.downloadChunk(ctx, chunk.start, chunk.end, &buf); err != nil {
+				if err := d.downloadChunkWithProgress(ctx, chunk.start, chunk.end, &buf, p, chunk.index, workerID, startTime); err != nil {
 					chunk.err = fmt.Errorf("worker %d failed to download chunk %d: %w", workerID, chunk.index, err)
-					if d.verbose && p != nil {
+					if p != nil {
 						p.Send(chunkProgressMsg{
 							chunkIndex: chunk.index,
 							start:      chunk.start,
 							end:        chunk.end,
 							status:     "failed",
 							workerID:   workerID,
+							startTime:  startTime,
 						})
 					}
 					resultChan <- chunk
 					continue
 				}
-				
+
 				chunk.data = buf.Bytes()
-				if d.verbose && p != nil {
+
+				// Calculate download speed
+				elapsed := time.Since(startTime).Seconds()
+				chunkSize := float64(chunk.end - chunk.start + 1)
+				speed := 0.0
+				if elapsed > 0 {
+					speed = chunkSize / elapsed
+				}
+
+				if p != nil {
 					p.Send(chunkProgressMsg{
 						chunkIndex: chunk.index,
 						start:      chunk.start,
 						end:        chunk.end,
 						status:     "completed",
 						workerID:   workerID,
+						startTime:  startTime,
+						speed:      speed,
+					bytesDownloaded: int64(len(chunk.data)),
 					})
 				}
 				resultChan <- chunk
@@ -87,38 +122,48 @@ func (d *Downloader) downloadInOrderParallel(ctx context.Context, writer io.Writ
 	}
 	
 	// Chunk producer goroutine - feeds work to downloaders with flow control
+	producerDone := make(chan struct{})
 	go func() {
 		defer close(downloadQueue)
-		
+		defer close(producerDone)
+
 		for i := 0; i < totalChunks; i++ {
 			start := int64(i) * d.chunkSize
 			end := start + d.chunkSize - 1
 			if end >= d.totalSize {
 				end = d.totalSize - 1
 			}
-			
+
 			// Skip if already downloaded (for resume support)
 			if d.state != nil && i < len(d.state.ChunkStates) && d.state.ChunkStates[i].Complete {
-				// Send empty chunk directly to result channel
+				// For completed chunks, we need to account for their size in byte position
+				chunkSize := end - start + 1
+				// Send empty chunk directly to result channel with size info
 				select {
-				case resultChan <- chunkInfo{index: i, data: []byte{}}:
+				case resultChan <- chunkInfo{index: i, data: make([]byte, 0), start: start, end: end}:
+					d.bytePosition.Add(chunkSize)
 				case <-ctx.Done():
 					return
 				}
 				continue
 			}
-			
+
 			// Queue for download with context checking
+			// The channel buffer size provides natural backpressure
 			select {
 			case downloadQueue <- chunkInfo{index: i, start: start, end: end}:
 				queuedChunks++
 			case <-ctx.Done():
 				return
 			}
-			
-			// Add small delay to prevent overwhelming the system
-			if i%100 == 0 && i > 0 {
-				time.Sleep(10 * time.Millisecond)
+
+			// Small delay every 10 chunks to allow some processing time
+			if i%10 == 0 && i > 0 {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(5 * time.Millisecond):
+				}
 			}
 		}
 	}()
@@ -127,22 +172,37 @@ func (d *Downloader) downloadInOrderParallel(ctx context.Context, writer io.Writ
 	writerErr := make(chan error, 1)
 	go func() {
 		defer close(writerErr)
-		
-		// Use a map to buffer out-of-order chunks with limited size
+
+		// Use a map to buffer out-of-order chunks
 		pendingChunks := make(map[int][]byte)
 		nextExpectedChunk := 0
 		chunksWritten := 0
-		
+
 		for chunksWritten < totalChunks {
 			select {
-			case chunk := <-resultChan:
+			case chunk, ok := <-resultChan:
+				if !ok {
+					// Channel closed, check if we got all chunks
+					if chunksWritten < totalChunks {
+						writerErr <- fmt.Errorf("result channel closed before all chunks received: %d/%d", chunksWritten, totalChunks)
+					}
+					return
+				}
+
 				if chunk.err != nil {
+					// Drain channels to unblock producer and workers
+					go func() {
+						for range resultChan {
+						}
+					}()
 					writerErr <- chunk.err
 					return
 				}
 				
-				// Store the chunk data if not empty
-				if len(chunk.data) > 0 {
+				// Store out-of-order chunks for later
+				// Note: We removed the strict memory limit check here to prevent deadlock
+				// The large resultChan buffer (maxChunksInMemory) provides backpressure instead
+				if chunk.index != nextExpectedChunk && len(chunk.data) > 0 {
 					pendingChunks[chunk.index] = chunk.data
 				}
 				
