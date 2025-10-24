@@ -194,64 +194,6 @@ func TestDetectArchiveType(t *testing.T) {
 	}
 }
 
-// TestGetStateFilename tests state filename generation
-func TestGetStateFilename(t *testing.T) {
-	tests := []struct {
-		name string
-		url  string
-	}{
-		{"Simple URL", "https://example.com/file.tar.gz"},
-		{"Complex URL", "https://example.com/path/to/file.tar.gz?query=value"},
-		{"Different URL", "https://different.com/file.tar.gz"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := getStateFilename(tt.url)
-
-			// Should start with .marianne-state-
-			expectedPrefix := ".marianne-state-"
-			if len(result) < len(expectedPrefix) {
-				t.Errorf("getStateFilename(%q) = %q, too short", tt.url, result)
-				return
-			}
-
-			if result[:len(expectedPrefix)] != expectedPrefix {
-				t.Errorf("getStateFilename(%q) = %q, doesn't start with %q", tt.url, result, expectedPrefix)
-			}
-
-			// Should end with .json
-			expectedSuffix := ".json"
-			if len(result) < len(expectedSuffix) {
-				t.Errorf("getStateFilename(%q) = %q, too short for suffix", tt.url, result)
-				return
-			}
-
-			if result[len(result)-len(expectedSuffix):] != expectedSuffix {
-				t.Errorf("getStateFilename(%q) = %q, doesn't end with %q", tt.url, result, expectedSuffix)
-			}
-
-			// Should be deterministic (same URL -> same filename)
-			result2 := getStateFilename(tt.url)
-			if result != result2 {
-				t.Errorf("getStateFilename(%q) not deterministic: %q != %q", tt.url, result, result2)
-			}
-		})
-	}
-
-	// Test collision resistance
-	t.Run("Different URLs should produce different filenames", func(t *testing.T) {
-		url1 := "https://example.com/file1.tar.gz"
-		url2 := "https://example.com/file2.tar.gz"
-
-		filename1 := getStateFilename(url1)
-		filename2 := getStateFilename(url2)
-
-		if filename1 == filename2 {
-			t.Errorf("Different URLs produced same filename: %q", filename1)
-		}
-	})
-}
 
 // TestNewDownloader tests downloader initialization
 func TestNewDownloader(t *testing.T) {
@@ -358,11 +300,6 @@ func TestNewDownloader(t *testing.T) {
 			// Check client is not nil
 			if d.client == nil {
 				t.Error("client should not be nil")
-			}
-
-			// Check shutdown channel is initialized
-			if d.shutdown == nil {
-				t.Error("shutdown channel should be initialized")
 			}
 		})
 	}

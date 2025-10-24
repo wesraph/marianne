@@ -32,7 +32,7 @@ func TestWorkerCountValidation(t *testing.T) {
 
 			// Verify downloader was created with correct worker count
 			if d == nil {
-				t.Error("Downloader should be created")
+				t.Fatal("Downloader should be created")
 			}
 			if d.workers != tt.expected {
 				t.Errorf("workers = %d, want %d", d.workers, tt.expected)
@@ -65,7 +65,7 @@ func TestChunkSizeValidation(t *testing.T) {
 			}
 
 			if d == nil {
-				t.Error("Downloader should be created")
+				t.Fatal("Downloader should be created")
 			}
 			if d.chunkSize != tt.expected {
 				t.Errorf("chunkSize = %d, want %d", d.chunkSize, tt.expected)
@@ -412,7 +412,7 @@ func TestURLValidation(t *testing.T) {
 			d := NewDownloader(tt.url, 4, 1024, "", 0, false, 3, 100*time.Millisecond, 1024*1024*1024)
 
 			if d == nil {
-				t.Error("Downloader should be created (no validation)")
+				t.Fatal("Downloader should be created (no validation)")
 			}
 
 			if d.url != tt.url {

@@ -24,14 +24,6 @@ func TestGetFileSize(t *testing.T) {
 	if d.totalSize != int64(len(content)) {
 		t.Errorf("totalSize = %d, want %d", d.totalSize, len(content))
 	}
-
-	if d.state == nil {
-		t.Error("state should be initialized after getFileSize()")
-	}
-
-	if d.state.ETag == "" {
-		t.Error("ETag should be set")
-	}
 }
 
 // TestGetFileSizeRetry tests retry logic on transient failures

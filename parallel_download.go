@@ -134,20 +134,6 @@ func (d *Downloader) downloadInOrderParallel(ctx context.Context, writer io.Writ
 				end = d.totalSize - 1
 			}
 
-			// Skip if already downloaded (for resume support)
-			if d.state != nil && i < len(d.state.ChunkStates) && d.state.ChunkStates[i].Complete {
-				// For completed chunks, we need to account for their size in byte position
-				chunkSize := end - start + 1
-				// Send empty chunk directly to result channel with size info
-				select {
-				case resultChan <- chunkInfo{index: i, data: make([]byte, 0), start: start, end: end}:
-					d.bytePosition.Add(chunkSize)
-				case <-ctx.Done():
-					return
-				}
-				continue
-			}
-
 			// Queue for download with context checking
 			// The channel buffer size provides natural backpressure
 			select {

@@ -162,10 +162,10 @@ func TestExtractZipFileBasic(t *testing.T) {
 	mock := NewMockHTTPServer(content)
 	defer mock.Close()
 
-	d := NewDownloader(mock.URL(), 4, 1024, "", 0, false, 3, 0, 1024*1024*1024)
-
 	// Skip ZIP extraction test - requires TUI integration
 	t.Skip("ZIP extraction requires TUI program which can't be easily mocked")
+
+	d := NewDownloader(mock.URL(), 4, 1024, "", 0, false, 3, 0, 1024*1024*1024)
 
 	// Create a mock TUI program
 	p := tea.NewProgram(initialModel(mock.URL(), 1024, false))

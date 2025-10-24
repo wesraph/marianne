@@ -4,9 +4,6 @@ import (
 	"archive/zip"
 	"bufio"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -18,7 +15,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -49,31 +45,6 @@ var (
 	Version = "dev"
 )
 
-// DownloadState stores the state of a download for resume
-type DownloadState struct {
-	URL            string       `json:"url"`
-	TotalSize      int64        `json:"total_size"`
-	Downloaded     int64        `json:"downloaded"`
-	BytePosition   int64        `json:"byte_position"` // Exact byte position in output file
-	ArchiveType    string       `json:"archive_type"`
-	OutputDir      string       `json:"output_dir"`
-	TempFile       string       `json:"temp_file"`
-	ChunkStates    []ChunkState `json:"chunk_states,omitempty"`
-	ExtractedFiles []string     `json:"extracted_files,omitempty"`
-	LastModified   string       `json:"last_modified"`
-	ETag           string       `json:"etag"`
-	Created        time.Time    `json:"created"`
-	Updated        time.Time    `json:"updated"`
-}
-
-// ChunkState tracks individual chunk progress
-type ChunkState struct {
-	Index      int   `json:"index"`
-	Start      int64 `json:"start"`
-	End        int64 `json:"end"`
-	Downloaded int64 `json:"downloaded"`
-	Complete   bool  `json:"complete"`
-}
 
 type Downloader struct {
 	url            string
@@ -85,20 +56,11 @@ type Downloader struct {
 	startTime      time.Time
 	rateLimiter    *rate.Limiter
 	bandwidthLimit int64
-	resumeFile     string
-	stateFile      string
-	state          *DownloadState
 	verbose        bool
 	maxRetries     int
 	initialDelay   time.Duration
 	maxDelay       time.Duration
 	backoffFactor  float64
-	mu             sync.Mutex
-	writeBuffer    *bufio.Writer // Track write buffer for flushing
-	currentFile    *os.File      // Track current file for proper cleanup
-	bytePosition   atomic.Int64  // Track exact byte position written (atomic to prevent race)
-	shutdown       chan struct{} // Signal for graceful shutdown
-	shutdownOnce   sync.Once     // Ensure shutdown is only called once
 	memoryLimit    int64         // Memory limit for buffering chunks
 }
 
@@ -150,7 +112,6 @@ func NewDownloader(url string, workers int, chunkSize int64, proxyURL string, ba
 		initialDelay:   retryDelay,
 		maxDelay:       defaultMaxDelay,
 		backoffFactor:  defaultBackoffFactor,
-		shutdown:       make(chan struct{}),
 		memoryLimit:    memoryLimit,
 	}
 
@@ -223,8 +184,8 @@ func (d *Downloader) retryWithBackoff(ctx context.Context, operation string, fn 
 func (d *Downloader) getFileSize() error {
 	var resp *http.Response
 	var size int64
-	
-	err := d.retryWithBackoff(nil, "get file size", func() error {
+
+	err := d.retryWithBackoff(context.Background(), "get file size", func() error {
 		var err error
 		resp, err = d.client.Head(d.url)
 		if err != nil {
@@ -249,23 +210,6 @@ func (d *Downloader) getFileSize() error {
 	}
 
 	d.totalSize = size
-
-	// Save ETag and Last-Modified for validation
-	if d.state == nil {
-		d.state = &DownloadState{
-			URL:       d.url,
-			TotalSize: size,
-			Created:   time.Now(),
-		}
-	}
-	d.state.ETag = resp.Header.Get("ETag")
-	d.state.LastModified = resp.Header.Get("Last-Modified")
-
-	// Check if server supports partial content (resume)
-	if resp.Header.Get("Accept-Ranges") != "bytes" {
-		// Some servers don't advertise but still support ranges, we'll try anyway
-	}
-
 	return nil
 }
 
@@ -717,42 +661,10 @@ func detectArchiveType(filename string) (string, string, bool, error) {
 	return "", "", false, fmt.Errorf("unknown archive type for file: %s", filename)
 }
 
-func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir string, resume bool) error {
-	// Set up state file
-	d.stateFile = getStateFilename(d.url)
-
-	// Try to load existing state if resuming
-	if resume {
-		if err := d.loadState(); err == nil {
-			p.Send(fileExtractedMsg(fmt.Sprintf("Loaded state: %s downloaded", formatBytes(d.state.Downloaded))))
-
-			// Validate the file hasn't changed
-			oldETag := d.state.ETag
-			oldLastModified := d.state.LastModified
-
-			if err := d.getFileSize(); err != nil {
-				return err
-			}
-
-			// Check if file has changed
-			if (oldETag != "" && oldETag != d.state.ETag) ||
-				(oldLastModified != "" && oldLastModified != d.state.LastModified) {
-				p.Send(fileExtractedMsg("Warning: Remote file has changed, starting fresh download"))
-				d.downloaded.Store(0)
-				d.state.Downloaded = 0
-				d.state.TempFile = ""
-			}
-		} else {
-			// No valid state, get file info
-			if err := d.getFileSize(); err != nil {
-				return err
-			}
-		}
-	} else {
-		// Not resuming, get file info
-		if err := d.getFileSize(); err != nil {
-			return err
-		}
+func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir string) error {
+	// Get file info
+	if err := d.getFileSize(); err != nil {
+		return err
 	}
 
 	d.startTime = time.Now()
@@ -763,14 +675,6 @@ func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir str
 		return err
 	}
 
-	if d.state != nil {
-		d.state.ArchiveType = "tar"
-		if isZip {
-			d.state.ArchiveType = "zip"
-		}
-		d.state.OutputDir = outputDir
-	}
-
 	// Create output directory if it doesn't exist
 	if outputDir != "" {
 		if err := os.MkdirAll(outputDir, 0755); err != nil {
@@ -778,29 +682,9 @@ func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir str
 		}
 	}
 
-	// Save initial state
-	d.saveState()
-
 	if isZip {
 		// Handle ZIP files
-		if d.state != nil && d.state.TempFile != "" {
-			d.resumeFile = d.state.TempFile
-		} else {
-			// Generate resume filename from URL
-			urlParts := strings.Split(d.url, "/")
-			filename := urlParts[len(urlParts)-1]
-			d.resumeFile = filepath.Join(os.TempDir(), fmt.Sprintf("marianne-resume-%s", filename))
-			if d.state != nil {
-				d.state.TempFile = d.resumeFile
-				d.saveState()
-			}
-		}
-
-		err := d.downloadAndExtractZip(ctx, p, outputDir, resume)
-		if err == nil {
-			d.cleanupState()
-		}
-		return err
+		return d.downloadAndExtractZip(ctx, p, outputDir)
 	}
 
 	// Handle tar-based archives
@@ -811,12 +695,6 @@ func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir str
 		if tarCommand != "" {
 			args = append(args, tarCommand)
 		}
-	}
-
-	// If resuming and we have extracted files, skip existing files
-	if resume && d.state != nil && len(d.state.ExtractedFiles) > 0 {
-		args = append(args, "-k") // --keep-old-files: don't overwrite existing files
-		p.Send(fileExtractedMsg(fmt.Sprintf("Resuming TAR extraction (found %d previously extracted files)", len(d.state.ExtractedFiles))))
 	}
 
 	args = append(args, "-xvf", "-")
@@ -860,14 +738,6 @@ func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir str
 				line := scanner.Text()
 				if line != "" {
 					p.Send(fileExtractedMsg(line))
-					// Track extracted files in state
-					if d.state != nil {
-						d.state.ExtractedFiles = append(d.state.ExtractedFiles, line)
-						// Save state periodically
-						if len(d.state.ExtractedFiles)%50 == 0 {
-							d.saveState()
-						}
-					}
 				}
 			}
 		}
@@ -906,11 +776,6 @@ func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir str
 						speed:      speed,
 						eta:        eta,
 					})
-
-					// Save state periodically (every 5 seconds)
-					if d.state != nil && currentTime.Sub(d.state.Updated).Seconds() > 5 {
-						d.saveState()
-					}
 
 					lastDownloaded = currentDownloaded
 					lastTime = currentTime
@@ -1028,168 +893,17 @@ func parseMemoryLimit(limit string, workers int) int64 {
 	return parseBandwidthLimit(limit)
 }
 
-// Generate state filename from URL
-func getStateFilename(url string) string {
-	h := sha256.Sum256([]byte(url))
-	// Create state file in current directory for easy access
-	return fmt.Sprintf(".marianne-state-%s.json", hex.EncodeToString(h[:8]))
-}
 
-// Save download state
-func (d *Downloader) saveState() error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	if d.state == nil {
-		d.state = &DownloadState{
-			URL:       d.url,
-			TotalSize: d.totalSize,
-			Created:   time.Now(),
-		}
-	}
-
-	d.state.Downloaded = d.downloaded.Load()
-	d.state.BytePosition = d.bytePosition.Load()
-	d.state.Updated = time.Now()
-
-	data, err := json.MarshalIndent(d.state, "", "  ")
+func (d *Downloader) downloadAndExtractZip(ctx context.Context, p *tea.Program, outputDir string) error {
+	// Create temp file
+	tmpFile, err := os.CreateTemp("", "marianne-*.zip")
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create temp file: %w", err)
 	}
-
-	return os.WriteFile(d.stateFile, data, 0644)
-}
-
-// GracefulShutdown handles SIGTERM signal and saves state properly
-// Uses sync.Once to ensure it can only be called once, preventing panics from double-closing channels
-func (d *Downloader) GracefulShutdown() error {
-	var shutdownErr error
-
-	d.shutdownOnce.Do(func() {
-		// Flush write buffer if it exists
-		if d.writeBuffer != nil {
-			if err := d.writeBuffer.Flush(); err != nil {
-				shutdownErr = fmt.Errorf("failed to flush write buffer: %w", err)
-				return
-			}
-		}
-
-		// Sync file to disk
-		if d.currentFile != nil {
-			if err := d.currentFile.Sync(); err != nil {
-				shutdownErr = fmt.Errorf("failed to sync file: %w", err)
-				return
-			}
-
-			// Get exact file position after flush
-			pos, err := d.currentFile.Seek(0, io.SeekCurrent)
-			if err == nil {
-				d.bytePosition.Store(pos)
-			}
-		}
-
-		// Save state with exact byte position
-		if err := d.saveState(); err != nil {
-			shutdownErr = fmt.Errorf("failed to save state: %w", err)
-			return
-		}
-
-		close(d.shutdown)
-	})
-
-	return shutdownErr
-}
-
-// Load download state
-func (d *Downloader) loadState() error {
-	data, err := os.ReadFile(d.stateFile)
-	if err != nil {
-		return err
-	}
-
-	state := &DownloadState{}
-	if err := json.Unmarshal(data, state); err != nil {
-		return err
-	}
-
-	// Verify URL matches
-	if state.URL != d.url {
-		return fmt.Errorf("state file URL mismatch")
-	}
-
-	d.state = state
-	d.downloaded.Store(state.Downloaded)
-	return nil
-}
-
-// Clean up state file
-func (d *Downloader) cleanupState() {
-	if d.stateFile != "" {
-		os.Remove(d.stateFile)
-	}
-}
-
-func (d *Downloader) downloadAndExtractZip(ctx context.Context, p *tea.Program, outputDir string, resume bool) error {
-	var tmpFile *os.File
-	var err error
-	var existingSize int64
-
-	// Check for resume
-	if resume && d.resumeFile != "" {
-		// Try to resume from existing file
-		if stat, err := os.Stat(d.resumeFile); err == nil {
-			existingSize = stat.Size()
-			if existingSize < d.totalSize {
-				// Open for append
-				tmpFile, err = os.OpenFile(d.resumeFile, os.O_RDWR, 0644)
-				if err == nil {
-					d.downloaded.Store(existingSize)
-					d.bytePosition.Store(existingSize)
-					p.Send(progressMsg{
-						downloaded: existingSize,
-						total:      d.totalSize,
-						speed:      0,
-						eta:        0,
-					})
-				}
-			} else if existingSize == d.totalSize {
-				// File already complete
-				tmpFile, err = os.Open(d.resumeFile)
-				if err != nil {
-					return err
-				}
-				defer tmpFile.Close()
-				// Skip download, go straight to extraction
-				return d.extractZipFile(tmpFile.Name(), outputDir, p)
-			}
-		}
-	}
-
-	// Check if we have a saved byte position from state
-	if resume && d.state != nil && d.state.BytePosition > 0 {
-		existingSize = d.state.BytePosition
-		d.bytePosition.Store(existingSize)
-	}
-
-	// If not resuming or resume failed, create new temp file
-	if tmpFile == nil {
-		tmpFile, err = os.CreateTemp("", "marianne-*.zip")
-		if err != nil {
-			return fmt.Errorf("failed to create temp file: %w", err)
-		}
-		d.resumeFile = tmpFile.Name()
-		existingSize = 0
-	}
-
-	// Track the file for graceful shutdown
-	d.currentFile = tmpFile
 
 	defer func() {
 		tmpFile.Close()
-		d.currentFile = nil
-		if !resume {
-			os.Remove(tmpFile.Name())
-		}
+		os.Remove(tmpFile.Name())
 	}()
 
 	// Progress reporter
@@ -1226,11 +940,6 @@ func (d *Downloader) downloadAndExtractZip(ctx context.Context, p *tea.Program, 
 						eta:        eta,
 					})
 
-					// Save state periodically (every 5 seconds)
-					if d.state != nil && currentTime.Sub(d.state.Updated).Seconds() > 5 {
-						d.saveState()
-					}
-
 					lastDownloaded = currentDownloaded
 					lastTime = currentTime
 				}
@@ -1240,12 +949,10 @@ func (d *Downloader) downloadAndExtractZip(ctx context.Context, p *tea.Program, 
 		}
 	}()
 
-	// Download to temp file (with resume if applicable)
-	if existingSize < d.totalSize {
-		if err := d.downloadToFileWithResume(ctx, tmpFile, existingSize); err != nil {
-			close(done)
-			return err
-		}
+	// Download to temp file
+	if err := d.downloadToFile(ctx, tmpFile); err != nil {
+		close(done)
+		return err
 	}
 	close(done)
 
@@ -1340,32 +1047,11 @@ func (d *Downloader) extractZipFile(filename string, outputDir string, p *tea.Pr
 	return nil
 }
 
-func (d *Downloader) downloadToFileWithResume(ctx context.Context, file *os.File, resumeFrom int64) error {
-	// Seek to end if resuming
-	if resumeFrom > 0 {
-		if _, err := file.Seek(resumeFrom, 0); err != nil {
-			return fmt.Errorf("failed to seek: %w", err)
-		}
-	}
-
-	// Use buffered writer for better disk I/O performance
-	bufWriter := bufio.NewWriterSize(file, 4*1024*1024) // 4MB buffer to reduce memory usage
-	d.writeBuffer = bufWriter // Track buffer for graceful shutdown
-	defer func() {
-		bufWriter.Flush()
-		d.writeBuffer = nil
-	}()
-
+func (d *Downloader) downloadToFile(ctx context.Context, file *os.File) error {
 	return d.retryWithBackoff(ctx, "download file", func() error {
-		// Download entire file or remaining part
 		req, err := http.NewRequestWithContext(ctx, "GET", d.url, nil)
 		if err != nil {
 			return err
-		}
-
-		// Add range header if resuming
-		if resumeFrom > 0 {
-			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", resumeFrom))
 		}
 
 		resp, err := d.client.Do(req)
@@ -1374,26 +1060,8 @@ func (d *Downloader) downloadToFileWithResume(ctx context.Context, file *os.File
 		}
 		defer resp.Body.Close()
 
-		// Check response status
-		expectedStatus := http.StatusOK
-		if resumeFrom > 0 {
-			expectedStatus = http.StatusPartialContent
-		}
-
-		if resp.StatusCode != expectedStatus {
-			// If we get 200 instead of 206 when resuming, server doesn't support resume
-			if resumeFrom > 0 && resp.StatusCode == http.StatusOK {
-				// Start from beginning
-				d.downloaded.Store(0)
-				if _, err := file.Seek(0, 0); err != nil {
-					return err
-				}
-				if err := file.Truncate(0); err != nil {
-					return err
-				}
-			} else {
-				return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-			}
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 		}
 
 		// Copy with rate limiting
@@ -1407,7 +1075,7 @@ func (d *Downloader) downloadToFileWithResume(ctx context.Context, file *os.File
 			}
 		}
 
-		_, err = io.Copy(bufWriter, reader)
+		_, err = io.Copy(file, reader)
 		return err
 	})
 }
@@ -1424,7 +1092,6 @@ func (r *rateLimitedReader) Read(p []byte) (int, error) {
 	if n > 0 {
 		r.limiter.WaitN(r.ctx, n)
 		r.downloader.downloaded.Add(int64(n))
-		r.downloader.bytePosition.Add(int64(n))
 	}
 	return n, err
 }
@@ -1437,9 +1104,6 @@ type countingWriter struct {
 
 func (w *countingWriter) Write(p []byte) (int, error) {
 	n, err := w.writer.Write(p)
-	if n > 0 {
-		w.downloader.bytePosition.Add(int64(n))
-	}
 	return n, err
 }
 
@@ -1451,7 +1115,6 @@ func main() {
 		proxyURL       = flag.String("proxy", "", "HTTP proxy URL (e.g., http://proxy:8080)")
 		bandwidthLimit = flag.String("limit", "", "Bandwidth limit (e.g., 1M, 500K, 2.5M)")
 		showVersion    = flag.Bool("version", false, "Show version and exit")
-		resume         = flag.Bool("resume", false, "Resume interrupted download (ZIP files only)")
 		verbose        = flag.Bool("verbose", false, "Show detailed progress of individual chunks")
 		memoryLimit    = flag.String("memory", "auto", "Memory limit for buffers (e.g., 1G, 500M, auto for 10% of system memory)")
 		maxRetries     = flag.Int("max-retries", defaultMaxRetries, "Maximum number of retry attempts for failed connections")
@@ -1474,7 +1137,6 @@ func main() {
 		fmt.Fprintln(os.Stderr, "  -output DIR    Output directory (creates if doesn't exist)")
 		fmt.Fprintln(os.Stderr, "  -proxy URL     HTTP proxy URL (e.g., http://proxy:8080)")
 		fmt.Fprintln(os.Stderr, "  -limit RATE    Bandwidth limit (e.g., 1M, 500K, 2.5M)")
-		fmt.Fprintln(os.Stderr, "  -resume        Resume interrupted download (ZIP files only)")
 		fmt.Fprintln(os.Stderr, "  -max-retries N Maximum retry attempts for failed connections (default: 10)")
 		fmt.Fprintln(os.Stderr, "  -retry-delay D Initial retry delay (default: 1s)")
 		fmt.Fprintln(os.Stderr, "\nSupported archive formats:")
@@ -1528,14 +1190,6 @@ func main() {
 
 	// Create TUI
 	model := initialModel(url, downloader.totalSize, *verbose)
-	if *resume {
-		// Check if state file exists
-		stateFile := getStateFilename(url)
-		if _, err := os.Stat(stateFile); err == nil {
-			model.extractedFiles = append(model.extractedFiles,
-				fmt.Sprintf("Resume state found at: %s", stateFile))
-		}
-	}
 
 	// Check if we're running in a TTY (interactive terminal)
 	// If not (e.g., piped output, background, CI/CD), use headless mode
@@ -1562,7 +1216,7 @@ func main() {
 	// Run download in background
 	errChan := make(chan error, 1)
 	go func() {
-		if err := downloader.Download(ctx, p, *outputDir, *resume); err != nil {
+		if err := downloader.Download(ctx, p, *outputDir); err != nil {
 			p.Send(errorMsg(err))
 			errChan <- err
 		} else {
@@ -1572,21 +1226,9 @@ func main() {
 
 	// Handle signals in background
 	go func() {
-		sig := <-sigChan
-		fmt.Fprintf(os.Stderr, "\nReceived signal %v, saving state and shutting down...\n", sig)
-		
+		<-sigChan
 		// Cancel context to stop download
 		cancel()
-		
-		// Save state and flush buffers
-		if err := downloader.GracefulShutdown(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error during graceful shutdown: %v\n", err)
-		} else {
-			stateFile := getStateFilename(url)
-			fmt.Fprintf(os.Stderr, "State saved to: %s\n", stateFile)
-			fmt.Fprintf(os.Stderr, "Resume with: marianne -resume %s\n", url)
-		}
-		
 		// Quit the TUI
 		p.Quit()
 	}()
