@@ -314,6 +314,12 @@ type fileExtractedMsg string
 type downloadCompleteMsg struct{}
 type errorMsg error
 
+type partProgressMsg struct {
+	partIndex  int
+	totalParts int
+	url        string
+}
+
 type chunkProgressMsg struct {
 	chunkIndex      int
 	start           int64
@@ -365,9 +371,14 @@ type model struct {
 	err            error
 	verbose        bool
 	chunkProgress  map[int]chunkProgressMsg
+
+	// Multi-part fields
+	isMultiPart bool
+	currentPart int // 1-indexed for display
+	totalParts  int
 }
 
-func initialModel(url string, totalSize int64, verbose bool) model {
+func initialModel(url string, totalSize int64, verbose bool, isMultiPart bool, totalParts int) model {
 	prog := progress.New(progress.WithDefaultGradient())
 	vp := viewport.New(80, 10)
 	vp.Style = lipgloss.NewStyle().
@@ -384,6 +395,9 @@ func initialModel(url string, totalSize int64, verbose bool) model {
 		startTime:     time.Now(),
 		verbose:       verbose,
 		chunkProgress: make(map[int]chunkProgressMsg),
+		isMultiPart:   isMultiPart,
+		totalParts:    totalParts,
+		currentPart:   1,
 	}
 }
 
@@ -448,6 +462,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.SetContent(content)
 		m.viewport.GotoBottom()
 
+	case partProgressMsg:
+		m.currentPart = msg.partIndex + 1 // 1-indexed for display
+		m.url = msg.url
+
 	case chunkProgressMsg:
 		// Update chunk progress map (for speed calculation and display)
 		m.chunkProgress[msg.chunkIndex] = msg
@@ -502,11 +520,21 @@ func (m model) View() string {
 	}
 
 	// Header with URL
-	header := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("211")).
-		MarginBottom(1).
-		Render(fmt.Sprintf("📥 Downloading: %s", m.url))
+	var header string
+	if m.isMultiPart {
+		header = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("211")).
+			MarginBottom(1).
+			Render(fmt.Sprintf("📥 Downloading Multi-Part Archive (Part %d/%d)\n%s",
+				m.currentPart, m.totalParts, m.url))
+	} else {
+		header = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("211")).
+			MarginBottom(1).
+			Render(fmt.Sprintf("📥 Downloading: %s", m.url))
+	}
 
 	// Progress bar (avoid division by zero)
 	var prog string
@@ -685,7 +713,53 @@ func detectArchiveType(filename string) (string, string, bool, error) {
 	return "", "", false, fmt.Errorf("unknown archive type for file: %s", filename)
 }
 
-func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir string) error {
+// parseArchiveFormat parses an explicit archive format string and returns the appropriate flags
+func parseArchiveFormat(format string) (string, string, bool, error) {
+	if format == "" {
+		return "", "", false, fmt.Errorf("empty format string")
+	}
+
+	format = strings.ToLower(strings.TrimSpace(format))
+
+	// Map of format names to their settings
+	formatMap := map[string]struct {
+		tarFlag    string
+		tarCommand string
+		isZip      bool
+	}{
+		"zip":       {"", "", true},
+		"tar":       {"", "", false},
+		"tar.gz":    {"-z", "", false},
+		"tgz":       {"-z", "", false},
+		"tar.bz2":   {"-j", "", false},
+		"tbz2":      {"-j", "", false},
+		"tbz":       {"-j", "", false},
+		"tar.xz":    {"-J", "", false},
+		"txz":       {"-J", "", false},
+		"tar.lz4":   {"-I", "lz4", false},
+		"tar.zst":   {"-I", "zstd", false},
+		"tar.zstd":  {"-I", "zstd", false},
+		"tar.lzma":  {"--lzma", "", false},
+		"tar.z":     {"-Z", "", false},
+	}
+
+	settings, ok := formatMap[format]
+	if !ok {
+		return "", "", false, fmt.Errorf("unsupported archive format: %s (supported: zip, tar, tar.gz, tar.bz2, tar.xz, tar.lz4, tar.zst, tar.lzma, tar.Z)", format)
+	}
+
+	return settings.tarFlag, settings.tarCommand, settings.isZip, nil
+}
+
+// detectOrUseArchiveType detects archive type from filename or uses forced format if provided
+func detectOrUseArchiveType(filename string, forcedFormat string) (string, string, bool, error) {
+	if forcedFormat != "" {
+		return parseArchiveFormat(forcedFormat)
+	}
+	return detectArchiveType(filename)
+}
+
+func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir string, forcedFormat string) error {
 	// Get file info
 	if err := d.getFileSize(); err != nil {
 		return err
@@ -693,8 +767,8 @@ func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir str
 
 	d.startTime = time.Now()
 
-	// Detect archive type from URL
-	tarFlag, tarCommand, isZip, err := detectArchiveType(d.url)
+	// Detect archive type from URL or use forced format
+	tarFlag, tarCommand, isZip, err := detectOrUseArchiveType(d.url, forcedFormat)
 	if err != nil {
 		return err
 	}
@@ -853,6 +927,319 @@ func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir str
 
 	p.Send(downloadCompleteMsg{})
 	return nil
+}
+
+// multiPartCountingWriter tracks bytes across multiple parts
+type multiPartCountingWriter struct {
+	writer          io.Writer
+	totalDownloaded *atomic.Int64
+}
+
+func (w *multiPartCountingWriter) Write(p []byte) (int, error) {
+	n, err := w.writer.Write(p)
+	if n > 0 {
+		w.totalDownloaded.Add(int64(n))
+	}
+	return n, err
+}
+
+// downloadMultiPart downloads and extracts a multi-part archive
+func downloadMultiPart(ctx context.Context, urls []string, partSizes []int64, p *tea.Program,
+	outputDir string, workers int, chunkSize int64, proxyURL string,
+	limitBytes int64, verbose bool, maxRetries int, retryDelay time.Duration,
+	memBytes int64, forcedFormat string) error {
+
+	// Detect archive type from first URL or use forced format
+	tarFlag, tarCommand, isZip, err := detectOrUseArchiveType(urls[0], forcedFormat)
+	if err != nil {
+		return err
+	}
+
+	// Create output directory if needed
+	if outputDir != "" {
+		if err := os.MkdirAll(outputDir, 0755); err != nil {
+			return fmt.Errorf("failed to create output directory: %w", err)
+		}
+	}
+
+	if isZip {
+		return downloadMultiPartZip(ctx, urls, partSizes, p, outputDir, workers, chunkSize,
+			proxyURL, limitBytes, verbose, maxRetries, retryDelay, memBytes)
+	}
+
+	return downloadMultiPartTar(ctx, urls, partSizes, p, outputDir, tarFlag, tarCommand,
+		workers, chunkSize, proxyURL, limitBytes, verbose,
+		maxRetries, retryDelay, memBytes)
+}
+
+// downloadMultiPartTar downloads and extracts a multi-part TAR archive with streaming
+func downloadMultiPartTar(ctx context.Context, urls []string, partSizes []int64, p *tea.Program,
+	outputDir string, tarFlag, tarCommand string,
+	workers int, chunkSize int64, proxyURL string, limitBytes int64,
+	verbose bool, maxRetries int, retryDelay time.Duration, memBytes int64) error {
+
+	// Build tar command (same as single-file path)
+	args := []string{}
+	if tarFlag != "" {
+		args = append(args, tarFlag)
+		if tarCommand != "" {
+			args = append(args, tarCommand)
+		}
+	}
+	args = append(args, "-xvf", "-")
+	if outputDir != "" {
+		args = append(args, "-C", outputDir)
+	}
+
+	cmd := exec.CommandContext(ctx, "tar", args...)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create stdin pipe: %w", err)
+	}
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create stdout pipe: %w", err)
+	}
+
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create stderr pipe: %w", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start tar command: %w", err)
+	}
+
+	// Read tar output
+	scannerDone := make(chan struct{})
+	go func() {
+		defer close(scannerDone)
+		scanner := bufio.NewScanner(io.MultiReader(stdout, stderr))
+		for scanner.Scan() {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				line := scanner.Text()
+				if line != "" {
+					p.Send(fileExtractedMsg(line))
+				}
+			}
+		}
+	}()
+
+	// Create pipe for concatenated parts
+	pipeReader, pipeWriter := io.Pipe()
+
+	// Copy from pipe to tar stdin
+	copyDone := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(stdin, pipeReader)
+		stdin.Close()
+		copyDone <- err
+	}()
+
+	// Calculate total size for progress
+	totalSize := int64(0)
+	for _, size := range partSizes {
+		totalSize += size
+	}
+
+	// Shared download counter across all parts
+	var totalDownloaded atomic.Int64
+
+	// Progress reporter for overall progress
+	done := make(chan struct{})
+	startTime := time.Now()
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		lastDownloaded := int64(0)
+		lastTime := time.Now()
+
+		for {
+			select {
+			case <-ticker.C:
+				currentDownloaded := totalDownloaded.Load()
+				currentTime := time.Now()
+
+				timeDiff := currentTime.Sub(lastTime).Seconds()
+				if timeDiff > 0 {
+					bytesDiff := currentDownloaded - lastDownloaded
+					speed := float64(bytesDiff) / timeDiff
+
+					totalElapsed := time.Since(startTime).Seconds()
+					remaining := totalSize - currentDownloaded
+					var eta time.Duration
+					if totalElapsed > 0 && currentDownloaded > 0 {
+						avgSpeed := float64(currentDownloaded) / totalElapsed
+						eta = time.Duration(float64(remaining)/avgSpeed) * time.Second
+					}
+
+					p.Send(progressMsg{
+						downloaded: currentDownloaded,
+						total:      totalSize,
+						speed:      speed,
+						eta:        eta,
+					})
+
+					lastDownloaded = currentDownloaded
+					lastTime = currentTime
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	// Download each part sequentially
+	for i, url := range urls {
+		// Send part progress message
+		p.Send(partProgressMsg{
+			partIndex:  i,
+			totalParts: len(urls),
+			url:        url,
+		})
+
+		// Create downloader for this part
+		d := NewDownloader(url, workers, chunkSize, proxyURL, limitBytes, verbose,
+			maxRetries, retryDelay, memBytes)
+		d.totalSize = partSizes[i]
+
+		// Create counting writer that updates overall progress
+		countingWriter := &multiPartCountingWriter{
+			writer:          pipeWriter,
+			totalDownloaded: &totalDownloaded,
+		}
+
+		// Download this part
+		if err := d.downloadInOrderParallel(ctx, countingWriter, p); err != nil {
+			pipeWriter.CloseWithError(err)
+			close(done)
+			cmd.Process.Kill()
+			return fmt.Errorf("failed to download part %d/%d: %w", i+1, len(urls), err)
+		}
+	}
+
+	// All parts downloaded
+	pipeWriter.Close()
+	close(done)
+
+	// Wait for copy to complete
+	copyErr := <-copyDone
+	if copyErr != nil {
+		return fmt.Errorf("copy error: %w", copyErr)
+	}
+
+	// Wait for tar to complete
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("tar command failed: %w", err)
+	}
+
+	p.Send(downloadCompleteMsg{})
+	return nil
+}
+
+// downloadMultiPartZip downloads and extracts a multi-part ZIP archive
+func downloadMultiPartZip(ctx context.Context, urls []string, partSizes []int64, p *tea.Program,
+	outputDir string, workers int, chunkSize int64, proxyURL string,
+	limitBytes int64, verbose bool, maxRetries int, retryDelay time.Duration,
+	memBytes int64) error {
+
+	// Create temp file for combined ZIP
+	tmpFile, err := os.CreateTemp("", "marianne-multipart-*.zip")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %w", err)
+	}
+	defer func() {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+	}()
+
+	// Calculate total size
+	totalSize := int64(0)
+	for _, size := range partSizes {
+		totalSize += size
+	}
+
+	var totalDownloaded atomic.Int64
+
+	// Progress reporter
+	done := make(chan struct{})
+	startTime := time.Now()
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		lastDownloaded := int64(0)
+		lastTime := time.Now()
+
+		for {
+			select {
+			case <-ticker.C:
+				currentDownloaded := totalDownloaded.Load()
+				currentTime := time.Now()
+
+				timeDiff := currentTime.Sub(lastTime).Seconds()
+				if timeDiff > 0 {
+					bytesDiff := currentDownloaded - lastDownloaded
+					speed := float64(bytesDiff) / timeDiff
+
+					totalElapsed := time.Since(startTime).Seconds()
+					remaining := totalSize - currentDownloaded
+					var eta time.Duration
+					if totalElapsed > 0 && currentDownloaded > 0 {
+						avgSpeed := float64(currentDownloaded) / totalElapsed
+						eta = time.Duration(float64(remaining)/avgSpeed) * time.Second
+					}
+
+					p.Send(progressMsg{
+						downloaded: currentDownloaded,
+						total:      totalSize,
+						speed:      speed,
+						eta:        eta,
+					})
+
+					lastDownloaded = currentDownloaded
+					lastTime = currentTime
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	// Download each part and append to temp file
+	for i, url := range urls {
+		p.Send(partProgressMsg{
+			partIndex:  i,
+			totalParts: len(urls),
+			url:        url,
+		})
+
+		d := NewDownloader(url, workers, chunkSize, proxyURL, limitBytes, verbose,
+			maxRetries, retryDelay, memBytes)
+		d.totalSize = partSizes[i]
+
+		// Create counting writer
+		countingWriter := &multiPartCountingWriter{
+			writer:          tmpFile,
+			totalDownloaded: &totalDownloaded,
+		}
+
+		// Download this part directly to temp file
+		if err := d.downloadInOrderParallel(ctx, countingWriter, p); err != nil {
+			close(done)
+			return fmt.Errorf("failed to download part %d/%d: %w", i+1, len(urls), err)
+		}
+	}
+
+	close(done)
+	tmpFile.Close()
+
+	// Extract the combined ZIP using existing extractZipFile
+	dummyDownloader := &Downloader{}
+	return dummyDownloader.extractZipFile(tmpFile.Name(), outputDir, p)
 }
 
 func parseBandwidthLimit(limit string) int64 {
@@ -1129,6 +1516,57 @@ func (w *countingWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// validateURLs performs pre-flight checks on all URLs
+// Returns slice of part sizes and error if validation fails
+func validateURLs(urls []string, client *http.Client) ([]int64, error) {
+	partSizes := make([]int64, len(urls))
+
+	for i, url := range urls {
+		// 1. Check URL format
+		if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+			return nil, fmt.Errorf("part %d: invalid URL format (must start with http:// or https://): %s", i+1, url)
+		}
+
+		// 2. HEAD request to get size and check range support
+		resp, err := client.Head(url)
+		if err != nil {
+			return nil, fmt.Errorf("part %d: cannot reach URL: %v\nURL: %s", i+1, err, url)
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("part %d: server returned status %d for URL: %s", i+1, resp.StatusCode, url)
+		}
+
+		// 3. Get Content-Length
+		size, err := strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 64)
+		if err != nil || size <= 0 {
+			return nil, fmt.Errorf("part %d: cannot determine file size (Content-Length missing or invalid): %s", i+1, url)
+		}
+		partSizes[i] = size
+
+		// 4. Check range support (required for parallel downloads)
+		acceptRanges := resp.Header.Get("Accept-Ranges")
+		if acceptRanges != "bytes" {
+			// Note: Some servers don't send Accept-Ranges but still support ranges
+			// We'll catch this during actual download if it fails
+		}
+	}
+
+	return partSizes, nil
+}
+
+// printValidationSummary prints a summary of validated URLs
+func printValidationSummary(urls []string, partSizes []int64) {
+	fmt.Println("Validating URLs...")
+	totalSize := int64(0)
+	for i, url := range urls {
+		fmt.Printf("  Part %d/%d: ✓ %s (%s)\n", i+1, len(urls), url, formatBytes(partSizes[i]))
+		totalSize += partSizes[i]
+	}
+	fmt.Printf("\nTotal download size: %s across %d parts\n\n", formatBytes(totalSize), len(urls))
+}
+
 func main() {
 	var (
 		workers        = flag.Int("workers", defaultWorkers, "Number of parallel workers")
@@ -1141,6 +1579,7 @@ func main() {
 		memoryLimit    = flag.String("memory", "auto", "Memory limit for buffers (e.g., 1G, 500M, auto for 10% of system memory)")
 		maxRetries     = flag.Int("max-retries", defaultMaxRetries, "Maximum number of retry attempts for failed connections")
 		retryDelay     = flag.Duration("retry-delay", defaultInitialDelay, "Initial retry delay (e.g., 1s, 500ms)")
+		archiveFormat  = flag.String("format", "", "Force archive format (zip, tar, tar.gz, tar.bz2, tar.xz, tar.lz4, tar.zst, tar.lzma, tar.Z)")
 	)
 	flag.Parse()
 
@@ -1151,8 +1590,8 @@ func main() {
 		os.Exit(0)
 	}
 
-	if flag.NArg() != 1 {
-		fmt.Fprintln(os.Stderr, "Usage: marianne [options] <url>")
+	if flag.NArg() < 1 {
+		fmt.Fprintln(os.Stderr, "Usage: marianne [options] <url> [url2] [url3] ...")
 		fmt.Fprintln(os.Stderr, "\nOptions:")
 		fmt.Fprintln(os.Stderr, "  -workers N     Number of parallel workers (default: 8)")
 		fmt.Fprintln(os.Stderr, "  -chunk N       Chunk size in bytes (default: 100MB)")
@@ -1161,13 +1600,21 @@ func main() {
 		fmt.Fprintln(os.Stderr, "  -limit RATE    Bandwidth limit (e.g., 1M, 500K, 2.5M)")
 		fmt.Fprintln(os.Stderr, "  -max-retries N Maximum retry attempts for failed connections (default: 10)")
 		fmt.Fprintln(os.Stderr, "  -retry-delay D Initial retry delay (default: 1s)")
+		fmt.Fprintln(os.Stderr, "  -format FMT    Force archive format (overrides auto-detection)")
 		fmt.Fprintln(os.Stderr, "\nSupported archive formats:")
 		fmt.Fprintln(os.Stderr, "  .zip, .tar, .tar.gz, .tgz, .tar.bz2, .tbz2, .tar.xz, .txz")
 		fmt.Fprintln(os.Stderr, "  .tar.lz4, .tar.zst, .tar.zstd, .tar.lzma, .tar.Z")
+		fmt.Fprintln(os.Stderr, "\nFormat flag values:")
+		fmt.Fprintln(os.Stderr, "  zip, tar, tar.gz, tgz, tar.bz2, tbz2, tar.xz, txz")
+		fmt.Fprintln(os.Stderr, "  tar.lz4, tar.zst, tar.zstd, tar.lzma, tar.z")
+		fmt.Fprintln(os.Stderr, "\nMulti-part archives:")
+		fmt.Fprintln(os.Stderr, "  Provide multiple URLs in order to download and concatenate parts:")
+		fmt.Fprintln(os.Stderr, "  marianne file.tar.gz.part1 file.tar.gz.part2 file.tar.gz.part3")
+		fmt.Fprintln(os.Stderr, "  marianne -format tar.gz file.001 file.002 file.003")
 		os.Exit(1)
 	}
 
-	url := flag.Arg(0)
+	urls := flag.Args()
 
 	// Parse bandwidth limit
 	var limitBytes int64
@@ -1202,16 +1649,69 @@ func main() {
 		fmt.Printf("Memory limit: %s (chunk size: %s)\n", formatBytes(memBytes), formatBytes(*chunkSize))
 	}
 
-	downloader := NewDownloader(url, *workers, *chunkSize, *proxyURL, limitBytes, *verbose, *maxRetries, *retryDelay, memBytes)
+	// Determine if multi-part download
+	isMultiPart := len(urls) > 1
 
-	// Get file size first
-	if err := downloader.getFileSize(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+	var model model
+	var totalSize int64
+
+	if isMultiPart {
+		// Multi-part download path
+		// Create HTTP client for validation
+		transport := &http.Transport{
+			MaxIdleConns:        1000,
+			MaxIdleConnsPerHost: 1000,
+			MaxConnsPerHost:     0,
+			IdleConnTimeout:     90 * time.Second,
+			DisableCompression:  true,
+			ForceAttemptHTTP2:   true,
+			DisableKeepAlives:   false,
+			TLSHandshakeTimeout: 10 * time.Second,
+		}
+		if *proxyURL != "" {
+			proxy, err := neturl.Parse(*proxyURL)
+			if err == nil {
+				transport.Proxy = http.ProxyURL(proxy)
+			}
+		}
+		client := &http.Client{
+			Transport: transport,
+			Timeout:   30 * time.Second, // For HEAD requests
+		}
+
+		// Validate all URLs
+		partSizes, err := validateURLs(urls, client)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "URL validation failed: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Print validation summary
+		printValidationSummary(urls, partSizes)
+
+		// Calculate total size
+		for _, size := range partSizes {
+			totalSize += size
+		}
+
+		// Create TUI with multi-part info
+		model = initialModel(urls[0], totalSize, *verbose, true, len(urls))
+	} else {
+		// Single URL download path
+		url := urls[0]
+		downloader := NewDownloader(url, *workers, *chunkSize, *proxyURL, limitBytes, *verbose, *maxRetries, *retryDelay, memBytes)
+
+		// Get file size first
+		if err := downloader.getFileSize(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+		totalSize = downloader.totalSize
+
+		// Create TUI
+		model = initialModel(url, downloader.totalSize, *verbose, false, 1)
 	}
-
-	// Create TUI
-	model := initialModel(url, downloader.totalSize, *verbose)
 
 	// Check if we're running in a TTY (interactive terminal)
 	// If not (e.g., piped output, background, CI/CD), use headless mode
@@ -1238,7 +1738,49 @@ func main() {
 	// Run download in background
 	errChan := make(chan error, 1)
 	go func() {
-		if err := downloader.Download(ctx, p, *outputDir); err != nil {
+		var err error
+		if isMultiPart {
+			// Multi-part download
+			// Re-get partSizes from validated URLs
+			transport := &http.Transport{
+				MaxIdleConns:        1000,
+				MaxIdleConnsPerHost: 1000,
+				MaxConnsPerHost:     0,
+				IdleConnTimeout:     90 * time.Second,
+				DisableCompression:  true,
+				ForceAttemptHTTP2:   true,
+				DisableKeepAlives:   false,
+				TLSHandshakeTimeout: 10 * time.Second,
+			}
+			if *proxyURL != "" {
+				proxy, parseErr := neturl.Parse(*proxyURL)
+				if parseErr == nil {
+					transport.Proxy = http.ProxyURL(proxy)
+				}
+			}
+			client := &http.Client{
+				Transport: transport,
+				Timeout:   30 * time.Second,
+			}
+			partSizes, validateErr := validateURLs(urls, client)
+			if validateErr != nil {
+				err = validateErr
+			} else {
+				err = downloadMultiPart(ctx, urls, partSizes, p, *outputDir, *workers, *chunkSize,
+					*proxyURL, limitBytes, *verbose, *maxRetries, *retryDelay, memBytes, *archiveFormat)
+			}
+		} else {
+			// Single URL download
+			url := urls[0]
+			downloader := NewDownloader(url, *workers, *chunkSize, *proxyURL, limitBytes, *verbose, *maxRetries, *retryDelay, memBytes)
+			if sizeErr := downloader.getFileSize(); sizeErr != nil {
+				err = sizeErr
+			} else {
+				err = downloader.Download(ctx, p, *outputDir, *archiveFormat)
+			}
+		}
+
+		if err != nil {
 			p.Send(errorMsg(err))
 			errChan <- err
 		} else {
