@@ -19,8 +19,10 @@
 ## ✨ Features
 
 - **⚡ Parallel Downloads**: Split files into chunks and download them concurrently for maximum speed
+- **🔗 Multi-Link Archives**: Download multi-part archives from multiple URLs and extract as one
 - **📊 Beautiful TUI**: Real-time progress bar, download stats, and live file extraction view
 - **🗜️ Auto-extraction**: Automatically detects and extracts various archive formats (ZIP, TAR, etc.)
+- **🎯 Format Override**: Force specific archive format with `--format` flag
 - **💾 Memory Efficient**: Automatic memory management with configurable limits
 - **🔄 Retry Logic**: Exponential backoff retry for robust downloads over unreliable connections
 - **📁 Output Control**: Specify output directory with automatic creation
@@ -69,6 +71,8 @@ Progress: 45.2% | Downloaded: 2.3 GB/5.1 GB | Speed: 25.4 MB/s | Avg: 22.1 MB/s 
 
 ## 🆕 What's New
 
+- **Multi-Link Archives**: Download archives split across multiple URLs (e.g., part1, part2, part3)
+- **Format Override**: Force archive type with `--format` flag instead of auto-detection
 - **ZIP Support**: Now supports ZIP file extraction alongside TAR archives
 - **HTTP Proxy**: Connect through HTTP proxies with `-proxy` flag
 - **Bandwidth Limiting**: Control download speed with `-limit` flag
@@ -127,7 +131,14 @@ make static
 ### Basic Usage
 
 ```bash
+# Download single archive
 ./marianne https://example.com/large-file.tar.gz
+
+# Download multi-part archive (multiple URLs)
+./marianne https://example.com/part1.tar.gz https://example.com/part2.tar.gz https://example.com/part3.tar.gz
+
+# Force archive format (override auto-detection)
+./marianne --format tar.gz https://example.com/file-without-extension
 ```
 
 ### With Options
@@ -154,6 +165,9 @@ make static
 # Configure retry behavior
 ./marianne -max-retries 5 -retry-delay 2s https://example.com/unreliable-server.zip
 
+# Download multi-part archive with format override
+./marianne --format tar.xz https://cdn.example.com/data.part1 https://cdn.example.com/data.part2
+
 # Combine options
 ./marianne -output /data -workers 16 -memory 4G -verbose -limit 10M https://example.com/archive.zip
 ```
@@ -165,6 +179,7 @@ make static
 | `-workers` | Number of parallel download workers | 8 |
 | `-chunk` | Chunk size in bytes | 2097152 (2MB) |
 | `-output` | Output directory (creates if doesn't exist) | Current directory |
+| `-format` | Force archive format (zip, tar, tar.gz, tar.bz2, tar.xz, tar.lz4, tar.zst, tar.lzma, tar.Z) | Auto-detect |
 | `-proxy` | HTTP proxy URL (e.g., http://proxy:8080) | None |
 | `-limit` | Bandwidth limit (e.g., 1M, 500K, 2.5M) | Unlimited |
 | `-memory` | Memory limit for buffers (e.g., 1G, 500M, auto) | auto (10% of system memory) |
@@ -186,6 +201,26 @@ The tool automatically detects and extracts the following formats:
 - `.tar.zst`, `.tar.zstd` - Zstandard compressed
 - `.tar.lzma` - LZMA compressed
 - `.tar.Z` - Compress (.Z) format
+
+### Multi-Part Archives
+
+You can download archives split across multiple URLs by providing all URLs as arguments:
+
+```bash
+./marianne https://cdn.example.com/data.tar.gz.part1 \
+           https://cdn.example.com/data.tar.gz.part2 \
+           https://cdn.example.com/data.tar.gz.part3
+```
+
+**How it works:**
+- Each part is downloaded sequentially (one at a time)
+- Each part uses parallel chunk downloading for maximum speed
+- For TAR archives: parts are streamed and concatenated directly to extraction (no temp files)
+- For ZIP archives: parts are concatenated to a temp file, then extracted
+- Pre-flight validation checks all URLs before downloading
+- Progress shows both overall progress and current part
+
+**Use case:** Large blockchain snapshots, datasets, or backups that are distributed as multi-part archives.
 
 ## 🎮 Keyboard Controls
 
@@ -296,6 +331,8 @@ Built-in security protections for safe archive extraction:
 - [x] Memory management and optimization
 - [x] Retry logic with exponential backoff
 - [x] Verbose mode for chunk-level debugging
+- [x] Multi-link archive support (split archives)
+- [x] Archive format override flag
 - [ ] Resume interrupted downloads
 - [ ] Configuration file support
 - [ ] Parallel ZIP extraction

@@ -48,7 +48,7 @@ func TestExtractZipFileBasic(t *testing.T) {
 	d := NewDownloader(mock.URL(), 4, 1024, "", 0, false, 3, 0, 1024*1024*1024)
 
 	// Create a mock TUI program
-	p := tea.NewProgram(initialModel(mock.URL(), 1024, false))
+	p := tea.NewProgram(initialModel(mock.URL(), 1024, false, false, 1))
 
 	// Extract ZIP
 	err = d.extractZipFile(tmpZip.Name(), outputDir, p)
@@ -106,7 +106,7 @@ func TestExtractZipFileLarge(t *testing.T) {
 	defer mock.Close()
 
 	d := NewDownloader(mock.URL(), 4, 1024, "", 0, false, 3, 0, 1024*1024*1024)
-	p := tea.NewProgram(initialModel(mock.URL(), 1024, false))
+	p := tea.NewProgram(initialModel(mock.URL(), 1024, false, false, 1))
 
 	// Extract - this would fail with file descriptor exhaustion
 	// if the defer bug exists

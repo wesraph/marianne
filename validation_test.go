@@ -166,7 +166,7 @@ func TestZeroContentLength(t *testing.T) {
 
 // TestTUIDimensionUnderflow tests terminal dimension validation
 func TestTUIDimensionUnderflow(t *testing.T) {
-	m := initialModel("https://example.com/test.tar.gz", 1024, false)
+	m := initialModel("https://example.com/test.tar.gz", 1024, false, false, 1)
 
 	tests := []struct {
 		name   string
@@ -218,7 +218,7 @@ func TestTUIDimensionUnderflow(t *testing.T) {
 
 // TestDivisionByZeroInTUI tests TUI with zero total size
 func TestDivisionByZeroInTUI(t *testing.T) {
-	m := initialModel("https://example.com/test.tar.gz", 0, false) // Zero total
+	m := initialModel("https://example.com/test.tar.gz", 0, false, false, 1) // Zero total
 
 	defer func() {
 		if r := recover(); r != nil {
