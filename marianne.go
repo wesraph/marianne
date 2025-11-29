@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -64,10 +65,13 @@ type Downloader struct {
 	memoryLimit    int64 // Memory limit for buffering chunks
 }
 
-func NewDownloader(url string, workers int, chunkSize int64, proxyURL string, bandwidthLimit int64, verbose bool, maxRetries int, retryDelay time.Duration, memoryLimit int64) *Downloader {
+func NewDownloader(url string, workers int, chunkSize int64, proxyURL string, bandwidthLimit int64, verbose bool, maxRetries int, retryDelay time.Duration, memoryLimit int64) (*Downloader, error) {
 	// Validate input parameters
 	if workers <= 0 {
 		workers = 1 // Default to 1 worker
+	}
+	if workers > 1000 {
+		workers = 1000 // Cap at reasonable maximum
 	}
 	if chunkSize <= 0 {
 		chunkSize = defaultChunkSize // Use default chunk size
@@ -93,9 +97,10 @@ func NewDownloader(url string, workers int, chunkSize int64, proxyURL string, ba
 	// Configure proxy if provided
 	if proxyURL != "" {
 		proxy, err := neturl.Parse(proxyURL)
-		if err == nil {
-			transport.Proxy = http.ProxyURL(proxy)
+		if err != nil {
+			return nil, fmt.Errorf("invalid proxy URL: %w", err)
 		}
+		transport.Proxy = http.ProxyURL(proxy)
 	}
 
 	d := &Downloader{
@@ -120,7 +125,7 @@ func NewDownloader(url string, workers int, chunkSize int64, proxyURL string, ba
 		d.rateLimiter = rate.NewLimiter(rate.Limit(bandwidthLimit), int(bandwidthLimit))
 	}
 
-	return d
+	return d, nil
 }
 
 // retryWithBackoff executes a function with exponential backoff retry logic
@@ -759,7 +764,7 @@ func detectOrUseArchiveType(filename string, forcedFormat string) (string, strin
 	return detectArchiveType(filename)
 }
 
-func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir string, forcedFormat string) error {
+func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir string, forcedFormat string, tracker *cleanupTracker) error {
 	// Get file info
 	if err := d.getFileSize(); err != nil {
 		return err
@@ -782,7 +787,7 @@ func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir str
 
 	if isZip {
 		// Handle ZIP files
-		return d.downloadAndExtractZip(ctx, p, outputDir)
+		return d.downloadAndExtractZip(ctx, p, outputDir, tracker)
 	}
 
 	// Handle tar-based archives
@@ -947,7 +952,7 @@ func (w *multiPartCountingWriter) Write(p []byte) (int, error) {
 func downloadMultiPart(ctx context.Context, urls []string, partSizes []int64, p *tea.Program,
 	outputDir string, workers int, chunkSize int64, proxyURL string,
 	limitBytes int64, verbose bool, maxRetries int, retryDelay time.Duration,
-	memBytes int64, forcedFormat string) error {
+	memBytes int64, forcedFormat string, tracker *cleanupTracker) error {
 
 	// Detect archive type from first URL or use forced format
 	tarFlag, tarCommand, isZip, err := detectOrUseArchiveType(urls[0], forcedFormat)
@@ -964,7 +969,7 @@ func downloadMultiPart(ctx context.Context, urls []string, partSizes []int64, p 
 
 	if isZip {
 		return downloadMultiPartZip(ctx, urls, partSizes, p, outputDir, workers, chunkSize,
-			proxyURL, limitBytes, verbose, maxRetries, retryDelay, memBytes)
+			proxyURL, limitBytes, verbose, maxRetries, retryDelay, memBytes, tracker)
 	}
 
 	return downloadMultiPartTar(ctx, urls, partSizes, p, outputDir, tarFlag, tarCommand,
@@ -1103,8 +1108,14 @@ func downloadMultiPartTar(ctx context.Context, urls []string, partSizes []int64,
 		})
 
 		// Create downloader for this part
-		d := NewDownloader(url, workers, chunkSize, proxyURL, limitBytes, verbose,
+		d, err := NewDownloader(url, workers, chunkSize, proxyURL, limitBytes, verbose,
 			maxRetries, retryDelay, memBytes)
+		if err != nil {
+			pipeWriter.CloseWithError(err)
+			close(done)
+			cmd.Process.Kill()
+			return fmt.Errorf("failed to create downloader: %w", err)
+		}
 		d.totalSize = partSizes[i]
 
 		// Create counting writer that updates overall progress
@@ -1145,16 +1156,28 @@ func downloadMultiPartTar(ctx context.Context, urls []string, partSizes []int64,
 func downloadMultiPartZip(ctx context.Context, urls []string, partSizes []int64, p *tea.Program,
 	outputDir string, workers int, chunkSize int64, proxyURL string,
 	limitBytes int64, verbose bool, maxRetries int, retryDelay time.Duration,
-	memBytes int64) error {
+	memBytes int64, tracker *cleanupTracker) error {
 
 	// Create temp file for combined ZIP
 	tmpFile, err := os.CreateTemp("", "marianne-multipart-*.zip")
 	if err != nil {
 		return fmt.Errorf("failed to create temp file: %w", err)
 	}
+	tempFileName := tmpFile.Name()
+	// Register temp file for cleanup on interruption
+	if tracker != nil {
+		tracker.Add(tempFileName)
+	}
+	cleanupFile := false // Only cleanup on success
 	defer func() {
 		tmpFile.Close()
-		os.Remove(tmpFile.Name())
+		if cleanupFile {
+			// Unregister before removing
+			if tracker != nil {
+				tracker.Remove(tempFileName)
+			}
+			os.Remove(tempFileName)
+		}
 	}()
 
 	// Calculate total size
@@ -1217,8 +1240,12 @@ func downloadMultiPartZip(ctx context.Context, urls []string, partSizes []int64,
 			url:        url,
 		})
 
-		d := NewDownloader(url, workers, chunkSize, proxyURL, limitBytes, verbose,
+		d, err := NewDownloader(url, workers, chunkSize, proxyURL, limitBytes, verbose,
 			maxRetries, retryDelay, memBytes)
+		if err != nil {
+			close(done)
+			return fmt.Errorf("failed to create downloader: %w", err)
+		}
 		d.totalSize = partSizes[i]
 
 		// Create counting writer
@@ -1239,7 +1266,11 @@ func downloadMultiPartZip(ctx context.Context, urls []string, partSizes []int64,
 
 	// Extract the combined ZIP using existing extractZipFile
 	dummyDownloader := &Downloader{}
-	return dummyDownloader.extractZipFile(tmpFile.Name(), outputDir, p)
+	err = dummyDownloader.extractZipFile(tempFileName, outputDir, p)
+	if err == nil {
+		cleanupFile = true // Only cleanup on successful extraction
+	}
+	return err
 }
 
 func parseBandwidthLimit(limit string) int64 {
@@ -1301,16 +1332,59 @@ func parseMemoryLimit(limit string, workers int) int64 {
 	return parseBandwidthLimit(limit)
 }
 
-func (d *Downloader) downloadAndExtractZip(ctx context.Context, p *tea.Program, outputDir string) error {
+// cleanupTracker tracks temporary files for cleanup on interruption
+type cleanupTracker struct {
+	mu    sync.Mutex
+	files []string
+}
+
+func (c *cleanupTracker) Add(path string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.files = append(c.files, path)
+}
+
+func (c *cleanupTracker) Remove(path string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i, f := range c.files {
+		if f == path {
+			c.files = append(c.files[:i], c.files[i+1:]...)
+			break
+		}
+	}
+}
+
+func (c *cleanupTracker) Cleanup() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, f := range c.files {
+		os.Remove(f)
+	}
+}
+
+func (d *Downloader) downloadAndExtractZip(ctx context.Context, p *tea.Program, outputDir string, tracker *cleanupTracker) error {
 	// Create temp file
 	tmpFile, err := os.CreateTemp("", "marianne-*.zip")
 	if err != nil {
 		return fmt.Errorf("failed to create temp file: %w", err)
 	}
+	tempFileName := tmpFile.Name()
+	// Register temp file for cleanup on interruption
+	if tracker != nil {
+		tracker.Add(tempFileName)
+	}
+	cleanupFile := false // Only cleanup on success
 
 	defer func() {
 		tmpFile.Close()
-		os.Remove(tmpFile.Name())
+		if cleanupFile {
+			// Unregister before removing
+			if tracker != nil {
+				tracker.Remove(tempFileName)
+			}
+			os.Remove(tempFileName)
+		}
 	}()
 
 	// Progress reporter
@@ -1366,24 +1440,32 @@ func (d *Downloader) downloadAndExtractZip(ctx context.Context, p *tea.Program, 
 	close(done)
 
 	// Extract ZIP file
-	return d.extractZipFile(tmpFile.Name(), outputDir, p)
+	err = d.extractZipFile(tempFileName, outputDir, p)
+	if err == nil {
+		cleanupFile = true // Only cleanup on successful extraction
+	}
+	return err
 }
 
 // validateZipPath checks if a zip entry path is safe (no path traversal)
 func validateZipPath(path string) error {
-	// Check for path traversal attempts
-	if strings.Contains(path, "..") {
-		return fmt.Errorf("path contains '..': %s", path)
+	// Check for null bytes
+	if strings.Contains(path, "\x00") {
+		return fmt.Errorf("path contains null byte: %s", path)
 	}
 
-	// Check for absolute paths
-	if filepath.IsAbs(path) {
+	// Clean the path and check if absolute
+	cleaned := filepath.Clean(path)
+	if filepath.IsAbs(cleaned) {
 		return fmt.Errorf("path is absolute: %s", path)
 	}
 
-	// Check for backslashes (Windows path separators used maliciously on Unix)
-	if strings.Contains(path, "\\") {
-		return fmt.Errorf("path contains backslash: %s", path)
+	// Check each component for ".."
+	parts := strings.Split(cleaned, string(filepath.Separator))
+	for _, part := range parts {
+		if part == ".." {
+			return fmt.Errorf("path traversal attempt: %s", path)
+		}
 	}
 
 	return nil
@@ -1422,7 +1504,9 @@ func (d *Downloader) extractZipFile(filename string, outputDir string, p *tea.Pr
 		p.Send(fileExtractedMsg(file.Name))
 
 		if file.FileInfo().IsDir() {
-			os.MkdirAll(path, file.Mode())
+			if err := os.MkdirAll(path, file.Mode()); err != nil {
+				return fmt.Errorf("failed to create directory %s: %w", path, err)
+			}
 			continue
 		}
 
@@ -1699,7 +1783,12 @@ func main() {
 	} else {
 		// Single URL download path
 		url := urls[0]
-		downloader := NewDownloader(url, *workers, *chunkSize, *proxyURL, limitBytes, *verbose, *maxRetries, *retryDelay, memBytes)
+		downloader, err := NewDownloader(url, *workers, *chunkSize, *proxyURL, limitBytes, *verbose, *maxRetries, *retryDelay, memBytes)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
 
 		// Get file size first
 		if err := downloader.getFileSize(); err != nil {
@@ -1724,6 +1813,9 @@ func main() {
 			tea.WithoutRenderer(),
 		)
 	}
+
+	// Create cleanup tracker for temp files
+	tracker := &cleanupTracker{}
 
 	// Set up signal handler for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
@@ -1765,16 +1857,18 @@ func main() {
 				err = validateErr
 			} else {
 				err = downloadMultiPart(ctx, urls, partSizes, p, *outputDir, *workers, *chunkSize,
-					*proxyURL, limitBytes, *verbose, *maxRetries, *retryDelay, memBytes, *archiveFormat)
+					*proxyURL, limitBytes, *verbose, *maxRetries, *retryDelay, memBytes, *archiveFormat, tracker)
 			}
 		} else {
 			// Single URL download
 			url := urls[0]
-			downloader := NewDownloader(url, *workers, *chunkSize, *proxyURL, limitBytes, *verbose, *maxRetries, *retryDelay, memBytes)
-			if sizeErr := downloader.getFileSize(); sizeErr != nil {
+			downloader, createErr := NewDownloader(url, *workers, *chunkSize, *proxyURL, limitBytes, *verbose, *maxRetries, *retryDelay, memBytes)
+			if createErr != nil {
+				err = createErr
+			} else if sizeErr := downloader.getFileSize(); sizeErr != nil {
 				err = sizeErr
 			} else {
-				err = downloader.Download(ctx, p, *outputDir, *archiveFormat)
+				err = downloader.Download(ctx, p, *outputDir, *archiveFormat, tracker)
 			}
 		}
 
@@ -1789,6 +1883,8 @@ func main() {
 	// Handle signals in background
 	go func() {
 		<-sigChan
+		// Cleanup temp files
+		tracker.Cleanup()
 		// Cancel context to stop download
 		cancel()
 		// Quit the TUI

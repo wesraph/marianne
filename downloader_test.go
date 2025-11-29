@@ -15,9 +15,12 @@ func TestGetFileSize(t *testing.T) {
 	mock := NewMockHTTPServer(content)
 	defer mock.Close()
 
-	d := NewDownloader(mock.URL(), 4, 1024*1024, "", 0, false, 3, 100*time.Millisecond, 1024*1024*1024)
+	d, err := NewDownloader(mock.URL(), 4, 1024*1024, "", 0, false, 3, 100*time.Millisecond, 1024*1024*1024)
+	if err != nil {
+		t.Fatalf("NewDownloader failed: %v", err)
+	}
 
-	err := d.getFileSize()
+	err = d.getFileSize()
 	if err != nil {
 		t.Fatalf("getFileSize() error = %v, want nil", err)
 	}
@@ -36,10 +39,13 @@ func TestGetFileSizeRetry(t *testing.T) {
 	// Fail first 2 attempts, succeed on 3rd
 	mock.SetMaxFailures(2)
 
-	d := NewDownloader(mock.URL(), 4, 1024, "", 0, false, 5, 50*time.Millisecond, 1024*1024*1024)
+	d, err := NewDownloader(mock.URL(), 4, 1024, "", 0, false, 5, 50*time.Millisecond, 1024*1024*1024)
+	if err != nil {
+		t.Fatalf("NewDownloader failed: %v", err)
+	}
 
 	start := time.Now()
-	err := d.getFileSize()
+	err = d.getFileSize()
 	elapsed := time.Since(start)
 
 	if err != nil {
@@ -66,9 +72,12 @@ func TestGetFileSizeExhaustedRetries(t *testing.T) {
 	// Fail more times than max retries
 	mock.SetMaxFailures(10)
 
-	d := NewDownloader(mock.URL(), 4, 1024, "", 0, false, 3, 50*time.Millisecond, 1024*1024*1024)
+	d, err := NewDownloader(mock.URL(), 4, 1024, "", 0, false, 3, 50*time.Millisecond, 1024*1024*1024)
+	if err != nil {
+		t.Fatalf("NewDownloader failed: %v", err)
+	}
 
-	err := d.getFileSize()
+	err = d.getFileSize()
 	if err == nil {
 		t.Fatal("getFileSize() error = nil, want error when retries exhausted")
 	}
@@ -87,13 +96,16 @@ func TestDownloadChunk(t *testing.T) {
 	mock := NewMockHTTPServer(content)
 	defer mock.Close()
 
-	d := NewDownloader(mock.URL(), 4, 1024, "", 0, false, 3, 100*time.Millisecond, 1024*1024*1024)
+	d, err := NewDownloader(mock.URL(), 4, 1024, "", 0, false, 3, 100*time.Millisecond, 1024*1024*1024)
+	if err != nil {
+		t.Fatalf("NewDownloader failed: %v", err)
+	}
 
 	ctx := context.Background()
 	var buf bytes.Buffer
 
 	// Download first 1KB
-	err := d.downloadChunk(ctx, 0, 1023, &buf)
+	err = d.downloadChunk(ctx, 0, 1023, &buf)
 	if err != nil {
 		t.Fatalf("downloadChunk() error = %v, want nil", err)
 	}
@@ -112,13 +124,16 @@ func TestDownloadChunkMiddle(t *testing.T) {
 	mock := NewMockHTTPServer(content)
 	defer mock.Close()
 
-	d := NewDownloader(mock.URL(), 4, 1024, "", 0, false, 3, 100*time.Millisecond, 1024*1024*1024)
+	d, err := NewDownloader(mock.URL(), 4, 1024, "", 0, false, 3, 100*time.Millisecond, 1024*1024*1024)
+	if err != nil {
+		t.Fatalf("NewDownloader failed: %v", err)
+	}
 
 	ctx := context.Background()
 	var buf bytes.Buffer
 
 	// Download bytes 5000-5999
-	err := d.downloadChunk(ctx, 5000, 5999, &buf)
+	err = d.downloadChunk(ctx, 5000, 5999, &buf)
 	if err != nil {
 		t.Fatalf("downloadChunk() error = %v, want nil", err)
 	}
@@ -139,12 +154,15 @@ func TestDownloadChunkRetry(t *testing.T) {
 	// Fail first 2 attempts
 	mock.SetMaxFailures(2)
 
-	d := NewDownloader(mock.URL(), 4, 1024, "", 0, false, 5, 50*time.Millisecond, 1024*1024*1024)
+	d, err := NewDownloader(mock.URL(), 4, 1024, "", 0, false, 5, 50*time.Millisecond, 1024*1024*1024)
+	if err != nil {
+		t.Fatalf("NewDownloader failed: %v", err)
+	}
 
 	ctx := context.Background()
 	var buf bytes.Buffer
 
-	err := d.downloadChunk(ctx, 0, 1023, &buf)
+	err = d.downloadChunk(ctx, 0, 1023, &buf)
 	if err != nil {
 		t.Fatalf("downloadChunk() with retries error = %v, want nil", err)
 	}
@@ -169,13 +187,16 @@ func TestDownloadChunkTimeout(t *testing.T) {
 	// Add delay longer than timeout
 	mock.SetRequestDelay(6 * time.Minute)
 
-	d := NewDownloader(mock.URL(), 4, 1024, "", 0, false, 1, 100*time.Millisecond, 1024*1024*1024)
+	d, err := NewDownloader(mock.URL(), 4, 1024, "", 0, false, 1, 100*time.Millisecond, 1024*1024*1024)
+	if err != nil {
+		t.Fatalf("NewDownloader failed: %v", err)
+	}
 
 	ctx := context.Background()
 	var buf bytes.Buffer
 
 	start := time.Now()
-	err := d.downloadChunk(ctx, 0, 1023, &buf)
+	err = d.downloadChunk(ctx, 0, 1023, &buf)
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -197,7 +218,10 @@ func TestDownloadChunkCancellation(t *testing.T) {
 	// Add delay to ensure we can cancel
 	mock.SetRequestDelay(100 * time.Millisecond)
 
-	d := NewDownloader(mock.URL(), 4, 1024, "", 0, false, 3, 50*time.Millisecond, 1024*1024*1024)
+	d, err := NewDownloader(mock.URL(), 4, 1024, "", 0, false, 3, 50*time.Millisecond, 1024*1024*1024)
+	if err != nil {
+		t.Fatalf("NewDownloader failed: %v", err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var buf bytes.Buffer
@@ -205,7 +229,7 @@ func TestDownloadChunkCancellation(t *testing.T) {
 	// Cancel immediately
 	cancel()
 
-	err := d.downloadChunk(ctx, 0, 1023, &buf)
+	err = d.downloadChunk(ctx, 0, 1023, &buf)
 	if err == nil {
 		t.Fatal("downloadChunk() error = nil, want cancellation error")
 	}
@@ -217,13 +241,16 @@ func TestDownloadChunkBoundary(t *testing.T) {
 	mock := NewMockHTTPServer(content)
 	defer mock.Close()
 
-	d := NewDownloader(mock.URL(), 4, 512, "", 0, false, 3, 100*time.Millisecond, 1024*1024*1024)
+	d, err := NewDownloader(mock.URL(), 4, 512, "", 0, false, 3, 100*time.Millisecond, 1024*1024*1024)
+	if err != nil {
+		t.Fatalf("NewDownloader failed: %v", err)
+	}
 
 	ctx := context.Background()
 	var buf bytes.Buffer
 
 	// Download last chunk (bytes 512-1023)
-	err := d.downloadChunk(ctx, 512, 1023, &buf)
+	err = d.downloadChunk(ctx, 512, 1023, &buf)
 	if err != nil {
 		t.Fatalf("downloadChunk() boundary error = %v, want nil", err)
 	}
@@ -244,7 +271,10 @@ func TestDownloadChunkServerNoRangeSupport(t *testing.T) {
 	// Disable range support
 	mock.SetSupportsRanges(false)
 
-	d := NewDownloader(mock.URL(), 4, 1024, "", 0, false, 3, 100*time.Millisecond, 1024*1024*1024)
+	d, err := NewDownloader(mock.URL(), 4, 1024, "", 0, false, 3, 100*time.Millisecond, 1024*1024*1024)
+	if err != nil {
+		t.Fatalf("NewDownloader failed: %v", err)
+	}
 
 	ctx := context.Background()
 	var buf bytes.Buffer
@@ -252,7 +282,7 @@ func TestDownloadChunkServerNoRangeSupport(t *testing.T) {
 	// Try to download a chunk - should fail because server doesn't support ranges
 	// When server doesn't support ranges, it returns 200 OK with full content,
 	// which is incompatible with parallel downloads and would corrupt the file
-	err := d.downloadChunk(ctx, 1024, 2047, &buf)
+	err = d.downloadChunk(ctx, 1024, 2047, &buf)
 	if err == nil {
 		t.Fatal("downloadChunk() error = nil, want error for server without range support")
 	}
@@ -266,10 +296,13 @@ func TestDownloadChunkServerNoRangeSupport(t *testing.T) {
 
 // TestRetryWithBackoffSuccess tests retry logic succeeds immediately
 func TestRetryWithBackoffSuccess(t *testing.T) {
-	d := NewDownloader("http://example.com/test", 4, 1024, "", 0, false, 3, 100*time.Millisecond, 1024*1024*1024)
+	d, err := NewDownloader("http://example.com/test", 4, 1024, "", 0, false, 3, 100*time.Millisecond, 1024*1024*1024)
 
+	if err != nil {
+		t.Fatalf("NewDownloader failed: %v", err)
+	}
 	attempts := 0
-	err := d.retryWithBackoff(context.Background(), "test operation", func() error {
+	err = d.retryWithBackoff(context.Background(), "test operation", func() error {
 		attempts++
 		return nil // Success on first try
 	})
@@ -285,10 +318,13 @@ func TestRetryWithBackoffSuccess(t *testing.T) {
 
 // TestRetryWithBackoffEventualSuccess tests retry succeeds after failures
 func TestRetryWithBackoffEventualSuccess(t *testing.T) {
-	d := NewDownloader("http://example.com/test", 4, 1024, "", 0, false, 5, 50*time.Millisecond, 1024*1024*1024)
+	d, err := NewDownloader("http://example.com/test", 4, 1024, "", 0, false, 5, 50*time.Millisecond, 1024*1024*1024)
 
+	if err != nil {
+		t.Fatalf("NewDownloader failed: %v", err)
+	}
 	attempts := 0
-	err := d.retryWithBackoff(context.Background(), "test operation", func() error {
+	err = d.retryWithBackoff(context.Background(), "test operation", func() error {
 		attempts++
 		if attempts < 3 {
 			return errors.New("temporary failure")
@@ -307,11 +343,14 @@ func TestRetryWithBackoffEventualSuccess(t *testing.T) {
 
 // TestRetryWithBackoffAllFail tests behavior when all retries fail
 func TestRetryWithBackoffAllFail(t *testing.T) {
-	d := NewDownloader("http://example.com/test", 4, 1024, "", 0, false, 3, 50*time.Millisecond, 1024*1024*1024)
+	d, err := NewDownloader("http://example.com/test", 4, 1024, "", 0, false, 3, 50*time.Millisecond, 1024*1024*1024)
 
+	if err != nil {
+		t.Fatalf("NewDownloader failed: %v", err)
+	}
 	attempts := 0
 	testErr := errors.New("persistent failure")
-	err := d.retryWithBackoff(context.Background(), "test operation", func() error {
+	err = d.retryWithBackoff(context.Background(), "test operation", func() error {
 		attempts++
 		return testErr
 	})
@@ -329,8 +368,11 @@ func TestRetryWithBackoffAllFail(t *testing.T) {
 
 // TestRetryWithBackoffCancellation tests context cancellation during retry
 func TestRetryWithBackoffCancellation(t *testing.T) {
-	d := NewDownloader("http://example.com/test", 4, 1024, "", 0, false, 10, 100*time.Millisecond, 1024*1024*1024)
+	d, err := NewDownloader("http://example.com/test", 4, 1024, "", 0, false, 10, 100*time.Millisecond, 1024*1024*1024)
 
+	if err != nil {
+		t.Fatalf("NewDownloader failed: %v", err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 
 	attempts := 0
@@ -348,7 +390,7 @@ func TestRetryWithBackoffCancellation(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 	cancel()
 
-	err := <-errChan
+	err = <-errChan
 	if err == nil {
 		t.Fatal("retryWithBackoff() error = nil, want cancellation error")
 	}
@@ -370,14 +412,17 @@ func TestRateLimitedReader(t *testing.T) {
 
 	// Set bandwidth limit to 10KB/s
 	bandwidthLimit := int64(10 * 1024)
-	d := NewDownloader(mock.URL(), 4, 1024, "", bandwidthLimit, false, 3, 100*time.Millisecond, 1024*1024*1024)
+	d, err := NewDownloader(mock.URL(), 4, 1024, "", bandwidthLimit, false, 3, 100*time.Millisecond, 1024*1024*1024)
+	if err != nil {
+		t.Fatalf("NewDownloader failed: %v", err)
+	}
 
 	ctx := context.Background()
 	var buf bytes.Buffer
 
 	start := time.Now()
 	// Download 30KB (should take ~3 seconds at 10KB/s after burst)
-	err := d.downloadChunk(ctx, 0, 30*1024-1, &buf)
+	err = d.downloadChunk(ctx, 0, 30*1024-1, &buf)
 	elapsed := time.Since(start)
 
 	if err != nil {

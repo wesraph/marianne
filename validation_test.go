@@ -23,8 +23,11 @@ func TestWorkerCountValidation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			d := NewDownloader("https://example.com/test.tar.gz", tt.workers, 1024, "", 0, false, 3, 100*time.Millisecond, 1024*1024*1024)
+			d, err := NewDownloader("https://example.com/test.tar.gz", tt.workers, 1024, "", 0, false, 3, 100*time.Millisecond, 1024*1024*1024)
 
+			if err != nil {
+				t.Fatalf("NewDownloader failed: %v", err)
+			}
 			// Validation now works - invalid values get set to default
 			if tt.workers <= 0 {
 				t.Logf("✅ FIXED: Worker count %d validated and set to default %d", tt.workers, tt.expected)
@@ -58,8 +61,11 @@ func TestChunkSizeValidation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			d := NewDownloader("https://example.com/test.tar.gz", 4, tt.chunkSize, "", 0, false, 3, 100*time.Millisecond, 1024*1024*1024)
+			d, err := NewDownloader("https://example.com/test.tar.gz", 4, tt.chunkSize, "", 0, false, 3, 100*time.Millisecond, 1024*1024*1024)
 
+			if err != nil {
+				t.Fatalf("NewDownloader failed: %v", err)
+			}
 			if tt.chunkSize <= 0 {
 				t.Logf("✅ FIXED: Chunk size %d validated and set to default %d", tt.chunkSize, tt.expected)
 			}
@@ -114,18 +120,25 @@ func TestProxyURLValidation(t *testing.T) {
 	}{
 		{"Valid proxy", "http://proxy:8080", false},
 		{"Valid with auth", "http://user:pass@proxy:8080", false},
-		{"Invalid URL - BUG: silently ignored", "not a url", false},
+		{"Relative path (parsed as valid)", "not a url", false}, // url.Parse accepts this as a relative path
 		{"Empty", "", false},
-		{"Malformed - BUG", "://broken", false},
+		{"Malformed", "://broken", true}, // This actually fails parsing
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			d := NewDownloader("https://example.com/test.tar.gz", 4, 1024, tt.proxyURL, 0, false, 3, 100*time.Millisecond, 1024*1024*1024)
+			d, err := NewDownloader("https://example.com/test.tar.gz", 4, 1024, tt.proxyURL, 0, false, 3, 100*time.Millisecond, 1024*1024*1024)
 
-			// Currently errors are silently ignored in proxy setup
 			if tt.wantErr {
-				t.Logf("BUG: Invalid proxy URL %q was silently ignored", tt.proxyURL)
+				if err == nil {
+					t.Errorf("NewDownloader with invalid proxy %q should have returned error", tt.proxyURL)
+				}
+				// Error is expected, test passed
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("NewDownloader failed: %v", err)
 			}
 
 			if d == nil {
@@ -149,9 +162,12 @@ func TestZeroContentLength(t *testing.T) {
 	mock := NewMockHTTPServer(content)
 	defer mock.Close()
 
-	d := NewDownloader(mock.URL(), 4, 1024, "", 0, false, 3, 100*time.Millisecond, 1024*1024*1024)
+	d, err := NewDownloader(mock.URL(), 4, 1024, "", 0, false, 3, 100*time.Millisecond, 1024*1024*1024)
+	if err != nil {
+		t.Fatalf("NewDownloader failed: %v", err)
+	}
 
-	err := d.getFileSize()
+	err = d.getFileSize()
 	if err != nil {
 		t.Fatalf("getFileSize() error = %v, want nil", err)
 	}
@@ -378,8 +394,11 @@ func TestMaxRetriesValidation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			d := NewDownloader("https://example.com/test.tar.gz", 4, 1024, "", 0, false, tt.maxRetries, 100*time.Millisecond, 1024*1024*1024)
+			d, err := NewDownloader("https://example.com/test.tar.gz", 4, 1024, "", 0, false, tt.maxRetries, 100*time.Millisecond, 1024*1024*1024)
 
+			if err != nil {
+				t.Fatalf("NewDownloader failed: %v", err)
+			}
 			if tt.maxRetries < 0 {
 				t.Logf("✅ FIXED: Negative max retries %d validated and set to default %d", tt.maxRetries, tt.expected)
 			}
@@ -409,8 +428,11 @@ func TestURLValidation(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Currently no URL validation in NewDownloader
-			d := NewDownloader(tt.url, 4, 1024, "", 0, false, 3, 100*time.Millisecond, 1024*1024*1024)
+			d, err := NewDownloader(tt.url, 4, 1024, "", 0, false, 3, 100*time.Millisecond, 1024*1024*1024)
 
+			if err != nil {
+				t.Fatalf("NewDownloader failed: %v", err)
+			}
 			if d == nil {
 				t.Fatal("Downloader should be created (no validation)")
 			}
@@ -427,8 +449,11 @@ func TestURLValidation(t *testing.T) {
 // TestRateLimiterBurstConfig tests rate limiter burst configuration
 func TestRateLimiterBurstConfig(t *testing.T) {
 	bandwidthLimit := int64(1024 * 1024) // 1MB/s
-	d := NewDownloader("https://example.com/test.tar.gz", 4, 1024, "", bandwidthLimit, false, 3, 100*time.Millisecond, 1024*1024*1024)
+	d, err := NewDownloader("https://example.com/test.tar.gz", 4, 1024, "", bandwidthLimit, false, 3, 100*time.Millisecond, 1024*1024*1024)
 
+	if err != nil {
+		t.Fatalf("NewDownloader failed: %v", err)
+	}
 	if d.rateLimiter == nil {
 		t.Fatal("Rate limiter should be initialized")
 	}
