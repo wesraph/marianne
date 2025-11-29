@@ -1707,8 +1707,6 @@ func main() {
 			os.Exit(1)
 		}
 
-		totalSize = downloader.totalSize
-
 		// Create TUI
 		model = initialModel(url, downloader.totalSize, *verbose, false, 1)
 	}
