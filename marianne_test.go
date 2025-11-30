@@ -249,7 +249,7 @@ func TestNewDownloader(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			d := NewDownloader(
+			d, err := NewDownloader(
 				tt.url,
 				tt.workers,
 				tt.chunkSize,
@@ -261,6 +261,9 @@ func TestNewDownloader(t *testing.T) {
 				tt.memoryLimit,
 			)
 
+			if err != nil {
+				t.Fatalf("NewDownloader failed: %v", err)
+			}
 			if d.url != tt.url {
 				t.Errorf("url = %q, want %q", d.url, tt.url)
 			}

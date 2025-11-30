@@ -45,7 +45,10 @@ func TestExtractZipFileBasic(t *testing.T) {
 	// Skip ZIP extraction test - requires TUI integration
 	t.Skip("ZIP extraction requires TUI program which can't be easily mocked")
 
-	d := NewDownloader(mock.URL(), 4, 1024, "", 0, false, 3, 0, 1024*1024*1024)
+	d, err := NewDownloader(mock.URL(), 4, 1024, "", 0, false, 3, 0, 1024*1024*1024)
+	if err != nil {
+		t.Fatalf("NewDownloader failed: %v", err)
+	}
 
 	// Create a mock TUI program
 	p := tea.NewProgram(initialModel(mock.URL(), 1024, false, false, 1))
@@ -105,7 +108,10 @@ func TestExtractZipFileLarge(t *testing.T) {
 	mock := NewMockHTTPServer(content)
 	defer mock.Close()
 
-	d := NewDownloader(mock.URL(), 4, 1024, "", 0, false, 3, 0, 1024*1024*1024)
+	d, err := NewDownloader(mock.URL(), 4, 1024, "", 0, false, 3, 0, 1024*1024*1024)
+	if err != nil {
+		t.Fatalf("NewDownloader failed: %v", err)
+	}
 	p := tea.NewProgram(initialModel(mock.URL(), 1024, false, false, 1))
 
 	// Extract - this would fail with file descriptor exhaustion
