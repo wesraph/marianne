@@ -3,6 +3,7 @@ package main
 import (
 	"archive/zip"
 	"bufio"
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
@@ -38,8 +39,11 @@ const (
 )
 
 const (
-	defaultWorkers   = 8               // Balanced worker count
-	defaultChunkSize = 2 * 1024 * 1024 // 2MB chunks for better granularity
+	defaultWorkers       = 8                   // Balanced worker count
+	defaultChunkSize     = 2 * 1024 * 1024     // 2MB chunks for better granularity
+	chunkReadBufferSize  = 256 * 1024          // 256KB buffer for reading chunks
+	maxWorkersLimit      = 1000                // Maximum allowed workers
+	validationTimeout    = 30 * time.Second    // Timeout for URL validation HEAD requests
 )
 
 var (
@@ -70,8 +74,8 @@ func NewDownloader(url string, workers int, chunkSize int64, proxyURL string, ba
 	if workers <= 0 {
 		workers = 1 // Default to 1 worker
 	}
-	if workers > 1000 {
-		workers = 1000 // Cap at reasonable maximum
+	if workers > maxWorkersLimit {
+		workers = maxWorkersLimit // Cap at reasonable maximum
 	}
 	if chunkSize <= 0 {
 		chunkSize = defaultChunkSize // Use default chunk size
@@ -167,11 +171,14 @@ func (d *Downloader) retryWithBackoff(ctx context.Context, operation string, fn 
 			timer := time.NewTimer(delay)
 			select {
 			case <-timer.C:
-				// Continue to next retry
+				// Timer fired, continue to next retry
+				// Note: Stop() returns false here but that's OK
 			case <-ctx.Done():
 				timer.Stop()
 				return fmt.Errorf("%s cancelled during retry: %w", operation, ctx.Err())
 			}
+			// Ensure timer is stopped to release resources
+			timer.Stop()
 		} else {
 			time.Sleep(delay)
 		}
@@ -224,6 +231,12 @@ func (d *Downloader) downloadChunk(ctx context.Context, start, end int64, writer
 
 func (d *Downloader) downloadChunkWithProgress(ctx context.Context, start, end int64, writer io.Writer, p *tea.Program, chunkIndex int, workerID int, startTime time.Time) error {
 	return d.retryWithBackoff(ctx, fmt.Sprintf("download chunk %d-%d", start, end), func() error {
+		// CRITICAL: Reset buffer before retry to prevent data corruption
+		// Without this, partial data from failed attempts accumulates in the buffer
+		if buf, ok := writer.(*bytes.Buffer); ok {
+			buf.Reset()
+		}
+
 		// Add timeout for individual chunks to prevent hanging
 		chunkCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 		defer cancel()
@@ -251,7 +264,25 @@ func (d *Downloader) downloadChunkWithProgress(ctx context.Context, start, end i
 			return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 		}
 
-		buf := make([]byte, 256*1024) // 256KB buffer to reduce memory usage
+		// Verify Content-Range header matches what we requested
+		// Per RFC 7233, 206 responses MUST include Content-Range header
+		contentRange := resp.Header.Get("Content-Range")
+		if contentRange == "" {
+			return fmt.Errorf("server returned 206 without Content-Range header")
+		}
+		// Parse and validate Content-Range header
+		// Format: "bytes start-end/total" or "bytes start-end/*"
+		var rangeStart, rangeEnd int64
+		var totalOrStar string
+		n, parseErr := fmt.Sscanf(contentRange, "bytes %d-%d/%s", &rangeStart, &rangeEnd, &totalOrStar)
+		if parseErr != nil || n != 3 {
+			return fmt.Errorf("malformed Content-Range header: %s", contentRange)
+		}
+		if rangeStart != start || rangeEnd != end {
+			return fmt.Errorf("Content-Range mismatch: requested bytes %d-%d but got bytes %d-%d", start, end, rangeStart, rangeEnd)
+		}
+
+		buf := make([]byte, chunkReadBufferSize) // Buffer to reduce memory usage
 		var totalRead int64
 		lastProgressTime := time.Now()
 
@@ -421,8 +452,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		m.progress.Width = msg.Width - 4
-		m.viewport.Width = msg.Width - 4
+
+		// Prevent negative width (minimum 10 for reasonable display)
+		progressWidth := msg.Width - 4
+		if progressWidth < 10 {
+			progressWidth = 10
+		}
+		m.progress.Width = progressWidth
+		m.viewport.Width = progressWidth
 
 		// Calculate viewport height with fixed space for chunks to prevent UI shifting
 		// Base UI: header(3) + progress bar(2) + stats(2) + files header(2) + padding(4) = 13 lines
@@ -433,11 +470,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		reservedLines := 13 + maxChunkLines
 
 		// Ensure minimum viewport height of 5 lines
-		if msg.Height-reservedLines < 5 {
-			m.viewport.Height = 5
-		} else {
-			m.viewport.Height = msg.Height - reservedLines
+		viewportHeight := msg.Height - reservedLines
+		if viewportHeight < 5 {
+			viewportHeight = 5
 		}
+		m.viewport.Height = viewportHeight
 
 	case progressMsg:
 		m.downloaded = msg.downloaded
@@ -458,11 +495,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if m.total > 0 {
-			m.avgSpeed = float64(m.downloaded) / time.Since(m.startTime).Seconds()
+			elapsed := time.Since(m.startTime).Seconds()
+			if elapsed > 0 {
+				m.avgSpeed = float64(m.downloaded) / elapsed
+			}
 		}
 
 	case fileExtractedMsg:
 		m.extractedFiles = append(m.extractedFiles, string(msg))
+		// Keep only last 1000 entries to prevent unbounded memory growth
+		// CRITICAL: Create new slice to release backing array memory
+		if len(m.extractedFiles) > 1000 {
+			newSlice := make([]string, 1000)
+			copy(newSlice, m.extractedFiles[len(m.extractedFiles)-1000:])
+			m.extractedFiles = newSlice
+		}
 		content := strings.Join(m.extractedFiles, "\n")
 		m.viewport.SetContent(content)
 		m.viewport.GotoBottom()
@@ -487,13 +534,33 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.extractedFiles = append(m.extractedFiles, chunkInfo)
 
 				// Keep only last 100 entries in verbose mode to prevent memory issues
+				// CRITICAL: Create new slice to release backing array memory
 				if len(m.extractedFiles) > 100 {
-					m.extractedFiles = m.extractedFiles[len(m.extractedFiles)-100:]
+					newSlice := make([]string, 100)
+					copy(newSlice, m.extractedFiles[len(m.extractedFiles)-100:])
+					m.extractedFiles = newSlice
 				}
 
 				content := strings.Join(m.extractedFiles, "\n")
 				m.viewport.SetContent(content)
 				m.viewport.GotoBottom()
+			}
+		}
+
+		// Clean up completed/failed chunks from the map to prevent unbounded growth
+		// This runs in the TUI update loop so it's thread-safe
+		if msg.status == "completed" || msg.status == "failed" {
+			// Keep only the last 100 entries total (active + completed/failed)
+			if len(m.chunkProgress) > 100 {
+				// Remove oldest completed/failed chunks (non-deterministic but acceptable)
+				for idx, chunk := range m.chunkProgress {
+					if (chunk.status == "completed" || chunk.status == "failed") && idx != msg.chunkIndex {
+						delete(m.chunkProgress, idx)
+						if len(m.chunkProgress) <= 100 {
+							break
+						}
+					}
+				}
 			}
 		}
 
@@ -686,7 +753,7 @@ var archiveTypes = []archiveType{
 	{[]string{".tar.lz4"}, "-I", "lz4"},
 	{[]string{".tar.zst", ".tar.zstd"}, "-I", "zstd"},
 	{[]string{".tar.lzma"}, "--lzma", ""},
-	{[]string{".tar.Z"}, "-Z", ""},
+	{[]string{".tar.z"}, "-Z", ""},
 	{[]string{".tar"}, "", ""},
 }
 
@@ -785,6 +852,11 @@ func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir str
 		}
 	}
 
+	// Check disk space before starting download
+	if err := checkDiskSpace(outputDir, d.totalSize); err != nil {
+		return err
+	}
+
 	if isZip {
 		// Handle ZIP files
 		return d.downloadAndExtractZip(ctx, p, outputDir, tracker)
@@ -828,11 +900,12 @@ func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir str
 		return fmt.Errorf("failed to start tar command: %w", err)
 	}
 
-	// Read tar output with timeout protection
-	scannerDone := make(chan struct{})
+	// Read tar output - goroutine exits when tar command closes pipes
 	go func() {
-		defer close(scannerDone)
 		scanner := bufio.NewScanner(io.MultiReader(stdout, stderr))
+		// Increase buffer size to handle very long filenames (up to 1MB)
+		buf := make([]byte, 0, 64*1024)
+		scanner.Buffer(buf, 1024*1024)
 		for scanner.Scan() {
 			select {
 			case <-ctx.Done():
@@ -894,12 +967,6 @@ func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir str
 	// Sequential download with parallel chunks
 	pipeReader, pipeWriter := io.Pipe()
 
-	// Create a counting writer to track bytes written
-	countingWriter := &countingWriter{
-		writer:     pipeWriter,
-		downloader: d,
-	}
-
 	// Start copying from pipe to tar stdin
 	copyDone := make(chan error, 1)
 	go func() {
@@ -908,9 +975,15 @@ func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir str
 		copyDone <- err
 	}()
 
-	// Download chunks
-	downloadErr := d.downloadInOrderParallel(ctx, countingWriter, p)
-	pipeWriter.Close()
+	// Download chunks - byte counting happens inside downloadInOrderParallel
+	downloadErr := d.downloadInOrderParallel(ctx, pipeWriter, p)
+
+	// Close pipe with error if download failed, otherwise close normally
+	if downloadErr != nil {
+		pipeWriter.CloseWithError(downloadErr)
+	} else {
+		pipeWriter.Close()
+	}
 
 	// Wait for copy to complete
 	copyErr := <-copyDone
@@ -919,6 +992,7 @@ func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir str
 
 	if downloadErr != nil {
 		cmd.Process.Kill()
+		cmd.Wait() // Prevent zombie process
 		return downloadErr
 	}
 
@@ -965,6 +1039,15 @@ func downloadMultiPart(ctx context.Context, urls []string, partSizes []int64, p 
 		if err := os.MkdirAll(outputDir, 0755); err != nil {
 			return fmt.Errorf("failed to create output directory: %w", err)
 		}
+	}
+
+	// Calculate total size and check disk space
+	totalSize := int64(0)
+	for _, size := range partSizes {
+		totalSize += size
+	}
+	if err := checkDiskSpace(outputDir, totalSize); err != nil {
+		return err
 	}
 
 	if isZip {
@@ -1016,11 +1099,12 @@ func downloadMultiPartTar(ctx context.Context, urls []string, partSizes []int64,
 		return fmt.Errorf("failed to start tar command: %w", err)
 	}
 
-	// Read tar output
-	scannerDone := make(chan struct{})
+	// Read tar output - goroutine exits when tar command closes pipes
 	go func() {
-		defer close(scannerDone)
 		scanner := bufio.NewScanner(io.MultiReader(stdout, stderr))
+		// Increase buffer size to handle very long filenames (up to 1MB)
+		buf := make([]byte, 0, 64*1024)
+		scanner.Buffer(buf, 1024*1024)
 		for scanner.Scan() {
 			select {
 			case <-ctx.Done():
@@ -1114,6 +1198,7 @@ func downloadMultiPartTar(ctx context.Context, urls []string, partSizes []int64,
 			pipeWriter.CloseWithError(err)
 			close(done)
 			cmd.Process.Kill()
+			cmd.Wait() // Prevent zombie process
 			return fmt.Errorf("failed to create downloader: %w", err)
 		}
 		d.totalSize = partSizes[i]
@@ -1129,6 +1214,7 @@ func downloadMultiPartTar(ctx context.Context, urls []string, partSizes []int64,
 			pipeWriter.CloseWithError(err)
 			close(done)
 			cmd.Process.Kill()
+			cmd.Wait() // Prevent zombie process
 			return fmt.Errorf("failed to download part %d/%d: %w", i+1, len(urls), err)
 		}
 	}
@@ -1296,7 +1382,12 @@ func parseBandwidthLimit(limit string) int64 {
 		return 0
 	}
 
-	return int64(value * float64(multiplier))
+	result := int64(value * float64(multiplier))
+	// Return 0 for negative values (invalid)
+	if result < 0 {
+		return 0
+	}
+	return result
 }
 
 func getSystemMemory() int64 {
@@ -1319,6 +1410,47 @@ func getSystemMemory() int64 {
 
 	// Default to 8GB if we can't determine
 	return 8 * 1024 * 1024 * 1024
+}
+
+// getAvailableDiskSpace returns available disk space in bytes for the given path
+func getAvailableDiskSpace(path string) (int64, error) {
+	var stat syscall.Statfs_t
+	err := syscall.Statfs(path, &stat)
+	if err != nil {
+		return 0, err
+	}
+	// Available blocks * block size = available space
+	return int64(stat.Bavail) * int64(stat.Bsize), nil
+}
+
+// checkDiskSpace verifies there's enough disk space for extraction
+// NOTE: This only checks for the compressed archive size + 10% buffer.
+// Archives typically decompress to much larger sizes, so this is a conservative
+// minimum check. For accurate estimation, we would need to scan archive headers
+// which is not practical for streaming extraction.
+// Requires at least fileSize + 10% buffer for archive metadata/overhead
+func checkDiskSpace(outputDir string, fileSize int64) error {
+	if outputDir == "" {
+		outputDir = "."
+	}
+
+	// Get available disk space
+	available, err := getAvailableDiskSpace(outputDir)
+	if err != nil {
+		// If we can't determine space, log warning but don't fail
+		// (might be on unsupported filesystem or platform)
+		return nil
+	}
+
+	// Require file size + 10% buffer for archive metadata/overhead
+	required := int64(float64(fileSize) * 1.1)
+
+	if available < required {
+		return fmt.Errorf("insufficient disk space: need %s, but only %s available in %s",
+			formatBytes(required), formatBytes(available), outputDir)
+	}
+
+	return nil
 }
 
 func parseMemoryLimit(limit string, workers int) int64 {
@@ -1487,7 +1619,7 @@ func (d *Downloader) extractZipFile(filename string, outputDir string, p *tea.Pr
 
 		path := filepath.Join(outputDir, file.Name)
 
-		// Double-check that the resolved path is within outputDir
+		// Double-check that the resolved path is within outputDir using filepath.Rel for cross-platform support
 		absPath, err := filepath.Abs(path)
 		if err != nil {
 			return fmt.Errorf("failed to resolve path: %w", err)
@@ -1496,8 +1628,54 @@ func (d *Downloader) extractZipFile(filename string, outputDir string, p *tea.Pr
 		if err != nil {
 			return fmt.Errorf("failed to resolve output dir: %w", err)
 		}
-		if !strings.HasPrefix(absPath, absOutputDir+string(filepath.Separator)) && absPath != absOutputDir {
+		// Use filepath.Rel to check if path is within output directory
+		relPath, err := filepath.Rel(absOutputDir, absPath)
+		if err != nil || strings.HasPrefix(relPath, ".."+string(filepath.Separator)) || relPath == ".." {
 			return fmt.Errorf("invalid file path (path traversal attempt): %s", file.Name)
+		}
+
+		// Check for symlinks - validate target to prevent path traversal attacks
+		// NOTE: This validation cannot prevent symlink chain attacks where multiple
+		// symlinks in the archive combine to escape the output directory. Each symlink
+		// is validated independently against the output directory, but chains of symlinks
+		// could still potentially escape if carefully crafted.
+		mode := file.Mode()
+		if mode&os.ModeSymlink != 0 {
+			// Read symlink target
+			fileReader, err := file.Open()
+			if err != nil {
+				return fmt.Errorf("failed to read symlink %s: %w", file.Name, err)
+			}
+			linkTarget, err := io.ReadAll(fileReader)
+			fileReader.Close()
+			if err != nil {
+				return fmt.Errorf("failed to read symlink target for %s: %w", file.Name, err)
+			}
+
+			// Resolve the symlink target relative to the symlink location
+			symlinkDir := filepath.Dir(path)
+			targetPath := filepath.Join(symlinkDir, string(linkTarget))
+			absTargetPath, err := filepath.Abs(targetPath)
+			if err != nil {
+				return fmt.Errorf("failed to resolve symlink target: %w", err)
+			}
+
+			// Verify symlink target is within output directory using filepath.Rel
+			relTargetPath, err := filepath.Rel(absOutputDir, absTargetPath)
+			if err != nil || strings.HasPrefix(relTargetPath, ".."+string(filepath.Separator)) || relTargetPath == ".." {
+				return fmt.Errorf("symlink path traversal attempt: %s -> %s (points outside extraction directory)", file.Name, string(linkTarget))
+			}
+
+			// Create the symlink
+			if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+				return fmt.Errorf("failed to create directory for symlink %s: %w", path, err)
+			}
+			if err := os.Symlink(string(linkTarget), path); err != nil {
+				return fmt.Errorf("failed to create symlink %s: %w", path, err)
+			}
+
+			p.Send(fileExtractedMsg(file.Name + " (symlink)"))
+			continue
 		}
 
 		// Send file extraction message
@@ -1529,10 +1707,14 @@ func (d *Downloader) extractZipFile(filename string, outputDir string, p *tea.Pr
 
 		_, err = io.Copy(targetFile, fileReader)
 		fileReader.Close()
-		targetFile.Close()
+		closeErr := targetFile.Close()
 
 		if err != nil {
 			return err
+		}
+		// Check for write errors that may only surface during Close()
+		if closeErr != nil {
+			return fmt.Errorf("failed to close file %s: %w", path, closeErr)
 		}
 	}
 
@@ -1583,38 +1765,44 @@ type rateLimitedReader struct {
 func (r *rateLimitedReader) Read(p []byte) (int, error) {
 	n, err := r.reader.Read(p)
 	if n > 0 {
-		r.limiter.WaitN(r.ctx, n)
+		if waitErr := r.limiter.WaitN(r.ctx, n); waitErr != nil {
+			return n, waitErr
+		}
 		r.downloader.downloaded.Add(int64(n))
 	}
 	return n, err
 }
 
-// countingWriter tracks bytes written for TAR downloads
-type countingWriter struct {
-	writer     io.Writer
-	downloader *Downloader
-}
-
-func (w *countingWriter) Write(p []byte) (int, error) {
-	n, err := w.writer.Write(p)
-	return n, err
-}
-
 // validateURLs performs pre-flight checks on all URLs
 // Returns slice of part sizes and error if validation fails
-func validateURLs(urls []string, client *http.Client) ([]int64, error) {
+func validateURLs(ctx context.Context, urls []string, client *http.Client) ([]int64, error) {
 	partSizes := make([]int64, len(urls))
 
 	for i, url := range urls {
+		// Check for context cancellation
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
 		// 1. Check URL format
 		if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
 			return nil, fmt.Errorf("part %d: invalid URL format (must start with http:// or https://): %s", i+1, url)
 		}
 
 		// 2. HEAD request to get size and check range support
-		resp, err := client.Head(url)
+		reqCtx, cancel := context.WithTimeout(ctx, validationTimeout)
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodHead, url, nil)
 		if err != nil {
-			return nil, fmt.Errorf("part %d: cannot reach URL: %v\nURL: %s", i+1, err, url)
+			cancel()
+			return nil, fmt.Errorf("part %d: failed to create request: %w", i+1, err)
+		}
+
+		resp, err := client.Do(req)
+		cancel()
+		if err != nil {
+			return nil, fmt.Errorf("part %d: cannot reach URL: %w\nURL: %s", i+1, err, url)
 		}
 		resp.Body.Close()
 
@@ -1678,7 +1866,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Usage: marianne [options] <url> [url2] [url3] ...")
 		fmt.Fprintln(os.Stderr, "\nOptions:")
 		fmt.Fprintln(os.Stderr, "  -workers N     Number of parallel workers (default: 8)")
-		fmt.Fprintln(os.Stderr, "  -chunk N       Chunk size in bytes (default: 100MB)")
+		fmt.Fprintln(os.Stderr, "  -chunk N       Chunk size in bytes (default: 2MB)")
 		fmt.Fprintln(os.Stderr, "  -output DIR    Output directory (creates if doesn't exist)")
 		fmt.Fprintln(os.Stderr, "  -proxy URL     HTTP proxy URL (e.g., http://proxy:8080)")
 		fmt.Fprintln(os.Stderr, "  -limit RATE    Bandwidth limit (e.g., 1M, 500K, 2.5M)")
@@ -1738,6 +1926,7 @@ func main() {
 
 	var model model
 	var totalSize int64
+	var partSizes []int64 // Store part sizes for multi-part downloads
 
 	if isMultiPart {
 		// Multi-part download path
@@ -1763,8 +1952,9 @@ func main() {
 			Timeout:   30 * time.Second, // For HEAD requests
 		}
 
-		// Validate all URLs
-		partSizes, err := validateURLs(urls, client)
+		// Validate all URLs (using background context since we're not yet in the cancellable part)
+		var err error
+		partSizes, err = validateURLs(context.Background(), urls, client)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "URL validation failed: %v\n", err)
 			os.Exit(1)
@@ -1830,35 +2020,9 @@ func main() {
 	go func() {
 		var err error
 		if isMultiPart {
-			// Multi-part download
-			// Re-get partSizes from validated URLs
-			transport := &http.Transport{
-				MaxIdleConns:        1000,
-				MaxIdleConnsPerHost: 1000,
-				MaxConnsPerHost:     0,
-				IdleConnTimeout:     90 * time.Second,
-				DisableCompression:  true,
-				ForceAttemptHTTP2:   true,
-				DisableKeepAlives:   false,
-				TLSHandshakeTimeout: 10 * time.Second,
-			}
-			if *proxyURL != "" {
-				proxy, parseErr := neturl.Parse(*proxyURL)
-				if parseErr == nil {
-					transport.Proxy = http.ProxyURL(proxy)
-				}
-			}
-			client := &http.Client{
-				Transport: transport,
-				Timeout:   30 * time.Second,
-			}
-			partSizes, validateErr := validateURLs(urls, client)
-			if validateErr != nil {
-				err = validateErr
-			} else {
-				err = downloadMultiPart(ctx, urls, partSizes, p, *outputDir, *workers, *chunkSize,
-					*proxyURL, limitBytes, *verbose, *maxRetries, *retryDelay, memBytes, *archiveFormat, tracker)
-			}
+			// Multi-part download - use already validated partSizes
+			err = downloadMultiPart(ctx, urls, partSizes, p, *outputDir, *workers, *chunkSize,
+				*proxyURL, limitBytes, *verbose, *maxRetries, *retryDelay, memBytes, *archiveFormat, tracker)
 		} else {
 			// Single URL download
 			url := urls[0]
@@ -1880,30 +2044,66 @@ func main() {
 		}
 	}()
 
+	// Track if signal was received to coordinate error handling
+	signalReceived := make(chan struct{})
+	tuiDone := make(chan struct{})
+
 	// Handle signals in background
 	go func() {
-		<-sigChan
-		// Cleanup temp files
-		tracker.Cleanup()
-		// Cancel context to stop download
-		cancel()
-		// Quit the TUI
-		p.Quit()
+		select {
+		case <-sigChan:
+			close(signalReceived)
+			// Stop listening for more signals immediately
+			signal.Stop(sigChan)
+			// Cancel context to stop download first
+			cancel()
+			// Wait for download goroutine to finish (with timeout)
+			// This ensures files are properly closed before cleanup
+			select {
+			case <-errChan:
+				// Download finished, safe to cleanup
+			case <-time.After(2 * time.Second):
+				// Timeout - cleanup anyway to avoid hanging
+			}
+			// Now cleanup temp files
+			tracker.Cleanup()
+			// Quit the TUI
+			p.Quit()
+		case <-tuiDone:
+			// Normal exit - stop listening for signals and exit cleanly
+			signal.Stop(sigChan)
+			return
+		}
 	}()
 
 	// Run TUI
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error running TUI: %v\n", err)
+		close(tuiDone) // Signal goroutine to exit
+		time.Sleep(10 * time.Millisecond) // Brief wait for goroutine cleanup
+		signal.Stop(sigChan) // Backup cleanup
 		os.Exit(1)
 	}
 
-	// Check for download errors
+	// Signal that TUI is done (allows signal handler goroutine to exit)
+	close(tuiDone)
+
+	// Brief wait to let signal handler goroutine complete cleanup
+	time.Sleep(10 * time.Millisecond)
+
+	// Check for download errors (only if signal wasn't received, as signal handler consumes errChan)
 	select {
-	case err := <-errChan:
-		if err != nil && err != context.Canceled {
-			os.Exit(1)
-		}
+	case <-signalReceived:
+		// Signal was received, error already handled by signal goroutine
 	default:
-		// Download may have been interrupted by signal
+		// No signal, check for download errors
+		select {
+		case err := <-errChan:
+			if err != nil && err != context.Canceled {
+				os.Exit(1)
+			}
+		default:
+			// Download completed without error
+		}
 	}
 }

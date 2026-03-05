@@ -7,8 +7,14 @@ import (
 	"io"
 	"sync"
 	"time"
-	
+
 	tea "github.com/charmbracelet/bubbletea"
+)
+
+const (
+	maxChunksInMemoryCap = 64          // Maximum chunks to buffer in memory
+	defaultMemoryLimit   = 1024 * 1024 * 1024 // 1GB default memory limit
+	memoryUsageFraction  = 0.8         // Use 80% of memory limit for chunks
 )
 
 // downloadInOrderParallel downloads chunks in parallel and writes them in order
@@ -28,26 +34,22 @@ func (d *Downloader) downloadInOrderParallel(ctx context.Context, writer io.Writ
 	// Calculate memory limits based on configured memory limit
 	memoryLimit := d.memoryLimit
 	if memoryLimit <= 0 {
-		// Default to 1GB if not set
-		memoryLimit = 1024 * 1024 * 1024
+		memoryLimit = defaultMemoryLimit
 	}
-	
+
 	// Calculate max chunks that can fit in memory
-	// Reserve 20% for other overhead
-	usableMemory := int64(float64(memoryLimit) * 0.8)
+	// Reserve some memory for other overhead
+	usableMemory := int64(float64(memoryLimit) * memoryUsageFraction)
 	maxChunksInMemory := int(usableMemory / d.chunkSize)
 	if maxChunksInMemory < d.workers*2 {
 		// Ensure at least 2 chunks per worker
 		maxChunksInMemory = d.workers * 2
 	}
-	if maxChunksInMemory > 64 {
-		// Cap at 64 to prevent excessive buffering
-		maxChunksInMemory = 64
+	if maxChunksInMemory > maxChunksInMemoryCap {
+		// Cap to prevent excessive buffering
+		maxChunksInMemory = maxChunksInMemoryCap
 	}
 	
-	// Track chunks that have been queued
-	queuedChunks := 0
-
 	// Channels for coordination with backpressure
 	downloadQueue := make(chan chunkInfo, d.workers*2) // Queue for workers
 	// Large buffer to prevent worker blocking when chunks arrive out of order
@@ -106,14 +108,14 @@ func (d *Downloader) downloadInOrderParallel(ctx context.Context, writer io.Writ
 
 				if p != nil {
 					p.Send(chunkProgressMsg{
-						chunkIndex: chunk.index,
-						start:      chunk.start,
-						end:        chunk.end,
-						status:     "completed",
-						workerID:   workerID,
-						startTime:  startTime,
-						speed:      speed,
-					bytesDownloaded: int64(len(chunk.data)),
+						chunkIndex:      chunk.index,
+						start:           chunk.start,
+						end:             chunk.end,
+						status:          "completed",
+						workerID:        workerID,
+						startTime:       startTime,
+						speed:           speed,
+						bytesDownloaded: int64(len(chunk.data)),
 					})
 				}
 				resultChan <- chunk
@@ -122,10 +124,8 @@ func (d *Downloader) downloadInOrderParallel(ctx context.Context, writer io.Writ
 	}
 	
 	// Chunk producer goroutine - feeds work to downloaders with flow control
-	producerDone := make(chan struct{})
 	go func() {
 		defer close(downloadQueue)
-		defer close(producerDone)
 
 		for i := 0; i < totalChunks; i++ {
 			start := int64(i) * d.chunkSize
@@ -138,18 +138,22 @@ func (d *Downloader) downloadInOrderParallel(ctx context.Context, writer io.Writ
 			// The channel buffer size provides natural backpressure
 			select {
 			case downloadQueue <- chunkInfo{index: i, start: start, end: end}:
-				queuedChunks++
+				// Chunk queued successfully
 			case <-ctx.Done():
 				return
 			}
 
 			// Small delay every 10 chunks to allow some processing time
 			if i%10 == 0 && i > 0 {
+				timer := time.NewTimer(5 * time.Millisecond)
 				select {
 				case <-ctx.Done():
+					timer.Stop()
 					return
-				case <-time.After(5 * time.Millisecond):
+				case <-timer.C:
+					// Timer fired
 				}
+				timer.Stop() // Release timer resources
 			}
 		}
 	}()
@@ -168,40 +172,74 @@ func (d *Downloader) downloadInOrderParallel(ctx context.Context, writer io.Writ
 			select {
 			case chunk, ok := <-resultChan:
 				if !ok {
-					// Channel closed, check if we got all chunks
-					if chunksWritten < totalChunks {
-						writerErr <- fmt.Errorf("result channel closed before all chunks received: %d/%d", chunksWritten, totalChunks)
+					// Channel closed - write any remaining pending chunks in order
+					// Note: When ok==false, the channel is already drained (all buffered items received)
+					// All chunks should be in pendingChunks map at this point
+					for chunksWritten < totalChunks {
+						if data, ok := pendingChunks[nextExpectedChunk]; ok {
+							if len(data) > 0 {
+								// CRITICAL: Check actual bytes written
+								n, err := writer.Write(data)
+								if err != nil {
+									writerErr <- fmt.Errorf("failed to write chunk %d: %w", nextExpectedChunk, err)
+									return
+								}
+								// Detect short writes
+								if n != len(data) {
+									writerErr <- fmt.Errorf("short write on chunk %d: wrote %d bytes, expected %d", nextExpectedChunk, n, len(data))
+									return
+								}
+								d.downloaded.Add(int64(n))
+							}
+							delete(pendingChunks, nextExpectedChunk)
+							nextExpectedChunk++
+							chunksWritten++
+						} else {
+							// Missing chunks - channel closed but we don't have all chunks
+							writerErr <- fmt.Errorf("result channel closed before all chunks received: %d/%d", chunksWritten, totalChunks)
+							return
+						}
 					}
+					// All chunks written successfully
+					writerErr <- nil
 					return
 				}
 
 				if chunk.err != nil {
-					// Drain channels to unblock producer and workers
-					go func() {
-						for range resultChan {
-						}
-					}()
+					// Return error immediately - the channel will be drained
+					// after downloadWg.Wait() completes and closes resultChan
 					writerErr <- chunk.err
 					return
 				}
-				
+
 				// Store all chunks for sequential writing
 				// Note: We removed the strict memory limit check here to prevent deadlock
 				// The large resultChan buffer (maxChunksInMemory) provides backpressure instead
 				if len(chunk.data) > 0 {
 					pendingChunks[chunk.index] = chunk.data
+				} else if len(chunk.data) == 0 {
+					// Chunk downloaded but has zero bytes - this might indicate an error
+					// Store it anyway to maintain chunk count, but it won't be written
+					pendingChunks[chunk.index] = chunk.data
 				}
-				
+
 				// Write any consecutive chunks we can
 				for {
 					if data, ok := pendingChunks[nextExpectedChunk]; ok {
 						if len(data) > 0 {
-							if _, err := writer.Write(data); err != nil {
+							// CRITICAL: Check actual bytes written, not assumed
+							n, err := writer.Write(data)
+							if err != nil {
 								writerErr <- fmt.Errorf("failed to write chunk %d: %w", nextExpectedChunk, err)
 								return
 							}
-							// Update progress based on actual bytes written
-							d.downloaded.Add(int64(len(data)))
+							// Detect short writes (writer didn't write all bytes)
+							if n != len(data) {
+								writerErr <- fmt.Errorf("short write on chunk %d: wrote %d bytes, expected %d", nextExpectedChunk, n, len(data))
+								return
+							}
+							// Update progress based on ACTUAL bytes written
+							d.downloaded.Add(int64(n))
 						}
 						delete(pendingChunks, nextExpectedChunk)
 						nextExpectedChunk++
@@ -222,7 +260,18 @@ func (d *Downloader) downloadInOrderParallel(ctx context.Context, writer io.Writ
 	// Wait for downloads to complete
 	downloadWg.Wait()
 	close(resultChan)
-	
+
 	// Wait for writer to complete
-	return <-writerErr
+	err := <-writerErr
+	if err != nil {
+		return err
+	}
+
+	// Verify total bytes written matches expected size
+	totalDownloaded := d.downloaded.Load()
+	if totalDownloaded != d.totalSize {
+		return fmt.Errorf("download size mismatch: expected %d bytes, got %d bytes (possible corruption)", d.totalSize, totalDownloaded)
+	}
+
+	return nil
 }

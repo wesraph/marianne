@@ -81,7 +81,7 @@ func TestParseBandwidthLimit(t *testing.T) {
 		{"Decimal MB", "2.5M", 2621440},
 		{"Whitespace", "  100K  ", 102400},
 		{"Invalid format", "ABC", 0},
-		{"Negative", "-100", -100},
+		{"Negative", "-100", 0}, // Negative values are invalid, return 0
 	}
 
 	for _, tt := range tests {
@@ -155,10 +155,8 @@ func TestDetectArchiveType(t *testing.T) {
 		{"TAR.ZST", "test.tar.zst", "-I", "zstd", false, false},
 		{"TAR.ZSTD", "test.tar.zstd", "-I", "zstd", false, false},
 		{"TAR.LZMA", "test.tar.lzma", "--lzma", "", false, false},
-		// BUG: tar.Z detection fails due to case mismatch
-		// detectArchiveType lowercases filename but archiveTypes has ".tar.Z"
-		// This test documents the bug - it should work but currently doesn't
-		// {"TAR.Z", "test.tar.Z", "-Z", "", false, false},
+		{"TAR.Z", "test.tar.Z", "-Z", "", false, false},
+		{"TAR.Z lowercase", "test.tar.z", "-Z", "", false, false},
 		{"Unsupported 7z", "test.7z", "", "", false, true},
 		{"Unsupported RAR", "test.rar", "", "", false, true},
 		{"Unknown extension", "test.unknown", "", "", false, true},
