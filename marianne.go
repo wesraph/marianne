@@ -757,6 +757,28 @@ var archiveTypes = []archiveType{
 	{[]string{".tar"}, "", ""},
 }
 
+// buildTarArgs constructs the argument list for the tar command.
+// When extractorArgs is provided and tarFlag is "-I", the extractor command and extra args
+// are combined into a single -I argument (e.g., -I "zstd -d -T0 --long=31").
+func buildTarArgs(tarFlag, tarCommand, extractorArgs, outputDir string) []string {
+	args := []string{}
+	if tarFlag != "" {
+		args = append(args, tarFlag)
+		if tarCommand != "" {
+			if extractorArgs != "" {
+				args = append(args, tarCommand+" "+extractorArgs)
+			} else {
+				args = append(args, tarCommand)
+			}
+		}
+	}
+	args = append(args, "-xvf", "-")
+	if outputDir != "" {
+		args = append(args, "-C", outputDir)
+	}
+	return args
+}
+
 func detectArchiveType(filename string) (string, string, bool, error) {
 	lowerName := strings.ToLower(filename)
 
@@ -831,7 +853,7 @@ func detectOrUseArchiveType(filename string, forcedFormat string) (string, strin
 	return detectArchiveType(filename)
 }
 
-func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir string, forcedFormat string, tracker *cleanupTracker) error {
+func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir string, forcedFormat string, extractorArgs string, tracker *cleanupTracker) error {
 	// Get file info
 	if err := d.getFileSize(); err != nil {
 		return err
@@ -864,19 +886,7 @@ func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir str
 
 	// Handle tar-based archives
 	// Build tar command
-	args := []string{}
-	if tarFlag != "" {
-		args = append(args, tarFlag)
-		if tarCommand != "" {
-			args = append(args, tarCommand)
-		}
-	}
-
-	args = append(args, "-xvf", "-")
-
-	if outputDir != "" {
-		args = append(args, "-C", outputDir)
-	}
+	args := buildTarArgs(tarFlag, tarCommand, extractorArgs, outputDir)
 
 	cmd := exec.CommandContext(ctx, "tar", args...)
 
@@ -1026,7 +1036,7 @@ func (w *multiPartCountingWriter) Write(p []byte) (int, error) {
 func downloadMultiPart(ctx context.Context, urls []string, partSizes []int64, p *tea.Program,
 	outputDir string, workers int, chunkSize int64, proxyURL string,
 	limitBytes int64, verbose bool, maxRetries int, retryDelay time.Duration,
-	memBytes int64, forcedFormat string, tracker *cleanupTracker) error {
+	memBytes int64, forcedFormat string, extractorArgs string, tracker *cleanupTracker) error {
 
 	// Detect archive type from first URL or use forced format
 	tarFlag, tarCommand, isZip, err := detectOrUseArchiveType(urls[0], forcedFormat)
@@ -1055,29 +1065,19 @@ func downloadMultiPart(ctx context.Context, urls []string, partSizes []int64, p 
 			proxyURL, limitBytes, verbose, maxRetries, retryDelay, memBytes, tracker)
 	}
 
-	return downloadMultiPartTar(ctx, urls, partSizes, p, outputDir, tarFlag, tarCommand,
+	return downloadMultiPartTar(ctx, urls, partSizes, p, outputDir, tarFlag, tarCommand, extractorArgs,
 		workers, chunkSize, proxyURL, limitBytes, verbose,
 		maxRetries, retryDelay, memBytes)
 }
 
 // downloadMultiPartTar downloads and extracts a multi-part TAR archive with streaming
 func downloadMultiPartTar(ctx context.Context, urls []string, partSizes []int64, p *tea.Program,
-	outputDir string, tarFlag, tarCommand string,
+	outputDir string, tarFlag, tarCommand string, extractorArgs string,
 	workers int, chunkSize int64, proxyURL string, limitBytes int64,
 	verbose bool, maxRetries int, retryDelay time.Duration, memBytes int64) error {
 
 	// Build tar command (same as single-file path)
-	args := []string{}
-	if tarFlag != "" {
-		args = append(args, tarFlag)
-		if tarCommand != "" {
-			args = append(args, tarCommand)
-		}
-	}
-	args = append(args, "-xvf", "-")
-	if outputDir != "" {
-		args = append(args, "-C", outputDir)
-	}
+	args := buildTarArgs(tarFlag, tarCommand, extractorArgs, outputDir)
 
 	cmd := exec.CommandContext(ctx, "tar", args...)
 	stdin, err := cmd.StdinPipe()
@@ -1852,6 +1852,7 @@ func main() {
 		maxRetries     = flag.Int("max-retries", defaultMaxRetries, "Maximum number of retry attempts for failed connections")
 		retryDelay     = flag.Duration("retry-delay", defaultInitialDelay, "Initial retry delay (e.g., 1s, 500ms)")
 		archiveFormat  = flag.String("format", "", "Force archive format (zip, tar, tar.gz, tar.bz2, tar.xz, tar.lz4, tar.zst, tar.lzma, tar.Z)")
+		extractorArgs  = flag.String("extractor-args", "", "Extra arguments for the extractor command (e.g., \"-d -T0 --long=31\" for zstd)")
 	)
 	flag.Parse()
 
@@ -1873,6 +1874,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "  -max-retries N Maximum retry attempts for failed connections (default: 10)")
 		fmt.Fprintln(os.Stderr, "  -retry-delay D Initial retry delay (default: 1s)")
 		fmt.Fprintln(os.Stderr, "  -format FMT    Force archive format (overrides auto-detection)")
+		fmt.Fprintln(os.Stderr, "  -extractor-args ARGS  Extra arguments for the extractor (e.g., \"-d -T0 --long=31\")")
 		fmt.Fprintln(os.Stderr, "\nSupported archive formats:")
 		fmt.Fprintln(os.Stderr, "  .zip, .tar, .tar.gz, .tgz, .tar.bz2, .tbz2, .tar.xz, .txz")
 		fmt.Fprintln(os.Stderr, "  .tar.lz4, .tar.zst, .tar.zstd, .tar.lzma, .tar.Z")
@@ -2022,7 +2024,7 @@ func main() {
 		if isMultiPart {
 			// Multi-part download - use already validated partSizes
 			err = downloadMultiPart(ctx, urls, partSizes, p, *outputDir, *workers, *chunkSize,
-				*proxyURL, limitBytes, *verbose, *maxRetries, *retryDelay, memBytes, *archiveFormat, tracker)
+				*proxyURL, limitBytes, *verbose, *maxRetries, *retryDelay, memBytes, *archiveFormat, *extractorArgs, tracker)
 		} else {
 			// Single URL download
 			url := urls[0]
@@ -2032,7 +2034,7 @@ func main() {
 			} else if sizeErr := downloader.getFileSize(); sizeErr != nil {
 				err = sizeErr
 			} else {
-				err = downloader.Download(ctx, p, *outputDir, *archiveFormat, tracker)
+				err = downloader.Download(ctx, p, *outputDir, *archiveFormat, *extractorArgs, tracker)
 			}
 		}
 
