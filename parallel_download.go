@@ -6,22 +6,26 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
 
 const (
-	maxChunksInMemoryCap = 64          // Maximum chunks to buffer in memory
-	defaultMemoryLimit   = 1024 * 1024 * 1024 // 1GB default memory limit
-	memoryUsageFraction  = 0.8         // Use 80% of memory limit for chunks
+	maxChunksInMemoryCap = 64                     // Maximum chunks to buffer in memory
+	defaultMemoryLimit   = 1024 * 1024 * 1024     // 1GB default memory limit
+	memoryUsageFraction  = 0.8                     // Use 80% of memory limit for chunks
 )
 
 // downloadInOrderParallel downloads chunks in parallel and writes them in order
 func (d *Downloader) downloadInOrderParallel(ctx context.Context, writer io.Writer, p *tea.Program) error {
+	// Reset download counter for accurate size verification
+	d.downloaded.Store(0)
+
 	// Calculate total chunks
 	totalChunks := int((d.totalSize + d.chunkSize - 1) / d.chunkSize)
-	
+
 	// Chunk info for tracking
 	type chunkInfo struct {
 		index int
@@ -30,7 +34,7 @@ func (d *Downloader) downloadInOrderParallel(ctx context.Context, writer io.Writ
 		data  []byte
 		err   error
 	}
-	
+
 	// Calculate memory limits based on configured memory limit
 	memoryLimit := d.memoryLimit
 	if memoryLimit <= 0 {
@@ -49,20 +53,26 @@ func (d *Downloader) downloadInOrderParallel(ctx context.Context, writer io.Writ
 		// Cap to prevent excessive buffering
 		maxChunksInMemory = maxChunksInMemoryCap
 	}
-	
+
+	// Inner context: cancelled when the writer hits an error, so workers unblock
+	innerCtx, innerCancel := context.WithCancel(ctx)
+	defer innerCancel()
+
+	// Flow control: tracks next chunk index the writer needs to write.
+	// The producer won't queue chunks more than maxChunksInMemory ahead of this.
+	var nextWritten atomic.Int64
+
 	// Channels for coordination with backpressure
 	downloadQueue := make(chan chunkInfo, d.workers*2) // Queue for workers
-	// Large buffer to prevent worker blocking when chunks arrive out of order
-	// This prevents deadlock where workers block on send while writer waits for next chunk
 	resultChan := make(chan chunkInfo, maxChunksInMemory)
-	
+
 	// Start download workers
 	var downloadWg sync.WaitGroup
 	for i := 0; i < d.workers; i++ {
 		downloadWg.Add(1)
 		go func(workerID int) {
 			defer downloadWg.Done()
-			
+
 			for chunk := range downloadQueue {
 				startTime := time.Now()
 
@@ -78,9 +88,11 @@ func (d *Downloader) downloadInOrderParallel(ctx context.Context, writer io.Writ
 					})
 				}
 
-				// Download the chunk
+				// Download the chunk with pre-allocated buffer
+				expectedSize := int(chunk.end - chunk.start + 1)
 				var buf bytes.Buffer
-				if err := d.downloadChunkWithProgress(ctx, chunk.start, chunk.end, &buf, p, chunk.index, workerID, startTime); err != nil {
+				buf.Grow(expectedSize)
+				if err := d.downloadChunkWithProgress(innerCtx, chunk.start, chunk.end, &buf, p, chunk.index, workerID, startTime); err != nil {
 					chunk.err = fmt.Errorf("worker %d failed to download chunk %d: %w", workerID, chunk.index, err)
 					if p != nil {
 						p.Send(chunkProgressMsg{
@@ -92,7 +104,11 @@ func (d *Downloader) downloadInOrderParallel(ctx context.Context, writer io.Writ
 							startTime:  startTime,
 						})
 					}
-					resultChan <- chunk
+					select {
+					case resultChan <- chunk:
+					case <-innerCtx.Done():
+						return
+					}
 					continue
 				}
 
@@ -118,11 +134,15 @@ func (d *Downloader) downloadInOrderParallel(ctx context.Context, writer io.Writ
 						bytesDownloaded: int64(len(chunk.data)),
 					})
 				}
-				resultChan <- chunk
+				select {
+				case resultChan <- chunk:
+				case <-innerCtx.Done():
+					return
+				}
 			}
 		}(i)
 	}
-	
+
 	// Chunk producer goroutine - feeds work to downloaders with flow control
 	go func() {
 		defer close(downloadQueue)
@@ -134,30 +154,32 @@ func (d *Downloader) downloadInOrderParallel(ctx context.Context, writer io.Writ
 				end = d.totalSize - 1
 			}
 
-			// Queue for download with context checking
-			// The channel buffer size provides natural backpressure
-			select {
-			case downloadQueue <- chunkInfo{index: i, start: start, end: end}:
-				// Chunk queued successfully
-			case <-ctx.Done():
-				return
-			}
-
-			// Small delay every 10 chunks to allow some processing time
-			if i%10 == 0 && i > 0 {
-				timer := time.NewTimer(5 * time.Millisecond)
+			// Flow control: don't get too far ahead of the writer.
+			// This bounds total in-flight chunk data to ~maxChunksInMemory * chunkSize.
+			for {
+				written := nextWritten.Load()
+				if int64(i)-written < int64(maxChunksInMemory) {
+					break
+				}
+				timer := time.NewTimer(10 * time.Millisecond)
 				select {
-				case <-ctx.Done():
+				case <-innerCtx.Done():
 					timer.Stop()
 					return
 				case <-timer.C:
-					// Timer fired
 				}
-				timer.Stop() // Release timer resources
+			}
+
+			// Queue for download with context checking
+			select {
+			case downloadQueue <- chunkInfo{index: i, start: start, end: end}:
+				// Chunk queued successfully
+			case <-innerCtx.Done():
+				return
 			}
 		}
 	}()
-	
+
 	// Writer goroutine that ensures chunks are written in order
 	writerErr := make(chan error, 1)
 	go func() {
@@ -173,18 +195,14 @@ func (d *Downloader) downloadInOrderParallel(ctx context.Context, writer io.Writ
 			case chunk, ok := <-resultChan:
 				if !ok {
 					// Channel closed - write any remaining pending chunks in order
-					// Note: When ok==false, the channel is already drained (all buffered items received)
-					// All chunks should be in pendingChunks map at this point
 					for chunksWritten < totalChunks {
 						if data, ok := pendingChunks[nextExpectedChunk]; ok {
 							if len(data) > 0 {
-								// CRITICAL: Check actual bytes written
 								n, err := writer.Write(data)
 								if err != nil {
 									writerErr <- fmt.Errorf("failed to write chunk %d: %w", nextExpectedChunk, err)
 									return
 								}
-								// Detect short writes
 								if n != len(data) {
 									writerErr <- fmt.Errorf("short write on chunk %d: wrote %d bytes, expected %d", nextExpectedChunk, n, len(data))
 									return
@@ -195,68 +213,59 @@ func (d *Downloader) downloadInOrderParallel(ctx context.Context, writer io.Writ
 							nextExpectedChunk++
 							chunksWritten++
 						} else {
-							// Missing chunks - channel closed but we don't have all chunks
 							writerErr <- fmt.Errorf("result channel closed before all chunks received: %d/%d", chunksWritten, totalChunks)
 							return
 						}
 					}
-					// All chunks written successfully
 					writerErr <- nil
 					return
 				}
 
 				if chunk.err != nil {
-					// Return error immediately - the channel will be drained
-					// after downloadWg.Wait() completes and closes resultChan
+					// Cancel inner context so workers and producer unblock
+					innerCancel()
 					writerErr <- chunk.err
 					return
 				}
 
-				// Store all chunks for sequential writing
-				// Note: We removed the strict memory limit check here to prevent deadlock
-				// The large resultChan buffer (maxChunksInMemory) provides backpressure instead
-				if len(chunk.data) > 0 {
-					pendingChunks[chunk.index] = chunk.data
-				} else if len(chunk.data) == 0 {
-					// Chunk downloaded but has zero bytes - this might indicate an error
-					// Store it anyway to maintain chunk count, but it won't be written
-					pendingChunks[chunk.index] = chunk.data
-				}
+				// Store chunk for sequential writing
+				pendingChunks[chunk.index] = chunk.data
 
 				// Write any consecutive chunks we can
 				for {
 					if data, ok := pendingChunks[nextExpectedChunk]; ok {
 						if len(data) > 0 {
-							// CRITICAL: Check actual bytes written, not assumed
 							n, err := writer.Write(data)
 							if err != nil {
+								innerCancel()
 								writerErr <- fmt.Errorf("failed to write chunk %d: %w", nextExpectedChunk, err)
 								return
 							}
-							// Detect short writes (writer didn't write all bytes)
 							if n != len(data) {
+								innerCancel()
 								writerErr <- fmt.Errorf("short write on chunk %d: wrote %d bytes, expected %d", nextExpectedChunk, n, len(data))
 								return
 							}
-							// Update progress based on ACTUAL bytes written
 							d.downloaded.Add(int64(n))
 						}
 						delete(pendingChunks, nextExpectedChunk)
 						nextExpectedChunk++
 						chunksWritten++
+						// Update flow control counter so producer can advance
+						nextWritten.Store(int64(nextExpectedChunk))
 					} else {
 						break
 					}
 				}
-			case <-ctx.Done():
-				writerErr <- ctx.Err()
+			case <-innerCtx.Done():
+				writerErr <- innerCtx.Err()
 				return
 			}
 		}
-		
+
 		writerErr <- nil
 	}()
-	
+
 	// Wait for downloads to complete
 	downloadWg.Wait()
 	close(resultChan)

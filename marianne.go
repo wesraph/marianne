@@ -239,10 +239,10 @@ func (d *Downloader) downloadChunkWithProgress(ctx context.Context, start, end i
 
 		// Add timeout for individual chunks to prevent hanging
 		chunkCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
-		defer cancel()
 
 		req, err := http.NewRequestWithContext(chunkCtx, "GET", d.url, nil)
 		if err != nil {
+			cancel()
 			return err
 		}
 
@@ -250,9 +250,16 @@ func (d *Downloader) downloadChunkWithProgress(ctx context.Context, start, end i
 
 		resp, err := d.client.Do(req)
 		if err != nil {
+			cancel()
 			return fmt.Errorf("chunk %d-%d request failed: %w", start, end, err)
 		}
-		defer resp.Body.Close()
+		defer func() {
+			// Drain body before closing to allow HTTP connection reuse,
+			// then cancel the context (order matters: drain must run before cancel)
+			io.CopyN(io.Discard, resp.Body, d.chunkSize+1)
+			resp.Body.Close()
+			cancel()
+		}()
 
 		// Servers that don't support range requests will return 200 OK with full content
 		// This is incompatible with parallel downloading, so we must reject it
@@ -854,9 +861,11 @@ func detectOrUseArchiveType(filename string, forcedFormat string) (string, strin
 }
 
 func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir string, forcedFormat string, extractorArgs string, tracker *cleanupTracker) error {
-	// Get file info
-	if err := d.getFileSize(); err != nil {
-		return err
+	// Get file info (skip if already fetched)
+	if d.totalSize < 0 {
+		if err := d.getFileSize(); err != nil {
+			return err
+		}
 	}
 
 	d.startTime = time.Now()
@@ -1007,6 +1016,8 @@ func (d *Downloader) Download(ctx context.Context, p *tea.Program, outputDir str
 	}
 
 	if copyErr != nil {
+		cmd.Process.Kill()
+		cmd.Wait()
 		return fmt.Errorf("copy error: %w", copyErr)
 	}
 
@@ -1226,6 +1237,8 @@ func downloadMultiPartTar(ctx context.Context, urls []string, partSizes []int64,
 	// Wait for copy to complete
 	copyErr := <-copyDone
 	if copyErr != nil {
+		cmd.Process.Kill()
+		cmd.Wait()
 		return fmt.Errorf("copy error: %w", copyErr)
 	}
 
@@ -1724,6 +1737,16 @@ func (d *Downloader) extractZipFile(filename string, outputDir string, p *tea.Pr
 
 func (d *Downloader) downloadToFile(ctx context.Context, file *os.File) error {
 	return d.retryWithBackoff(ctx, "download file", func() error {
+		// Reset file position and truncate on retry to prevent corruption
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("failed to seek file: %w", err)
+		}
+		if err := file.Truncate(0); err != nil {
+			return fmt.Errorf("failed to truncate file: %w", err)
+		}
+		// Reset download counter so progress reporting stays accurate on retry
+		d.downloaded.Store(0)
+
 		req, err := http.NewRequestWithContext(ctx, "GET", d.url, nil)
 		if err != nil {
 			return err
@@ -1733,7 +1756,11 @@ func (d *Downloader) downloadToFile(ctx context.Context, file *os.File) error {
 		if err != nil {
 			return err
 		}
-		defer resp.Body.Close()
+		defer func() {
+			// Drain at most 1MB to allow connection reuse for small error bodies
+			io.CopyN(io.Discard, resp.Body, 1<<20)
+			resp.Body.Close()
+		}()
 
 		if resp.StatusCode != http.StatusOK {
 			return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
@@ -1928,7 +1955,8 @@ func main() {
 
 	var model model
 	var totalSize int64
-	var partSizes []int64 // Store part sizes for multi-part downloads
+	var partSizes []int64            // Store part sizes for multi-part downloads
+	var singleDownloader *Downloader // Reused for single URL path
 
 	if isMultiPart {
 		// Multi-part download path
@@ -1961,6 +1989,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "URL validation failed: %v\n", err)
 			os.Exit(1)
 		}
+		transport.CloseIdleConnections()
 
 		// Print validation summary
 		printValidationSummary(urls, partSizes)
@@ -1973,23 +2002,23 @@ func main() {
 		// Create TUI with multi-part info
 		model = initialModel(urls[0], totalSize, *verbose, true, len(urls))
 	} else {
-		// Single URL download path
+		// Single URL download path - create downloader once and reuse for download
 		url := urls[0]
-		downloader, err := NewDownloader(url, *workers, *chunkSize, *proxyURL, limitBytes, *verbose, *maxRetries, *retryDelay, memBytes)
+		var err error
+		singleDownloader, err = NewDownloader(url, *workers, *chunkSize, *proxyURL, limitBytes, *verbose, *maxRetries, *retryDelay, memBytes)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
 
-
 		// Get file size first
-		if err := downloader.getFileSize(); err != nil {
+		if err := singleDownloader.getFileSize(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
 
 		// Create TUI
-		model = initialModel(url, downloader.totalSize, *verbose, false, 1)
+		model = initialModel(url, singleDownloader.totalSize, *verbose, false, 1)
 	}
 
 	// Check if we're running in a TTY (interactive terminal)
@@ -2026,16 +2055,8 @@ func main() {
 			err = downloadMultiPart(ctx, urls, partSizes, p, *outputDir, *workers, *chunkSize,
 				*proxyURL, limitBytes, *verbose, *maxRetries, *retryDelay, memBytes, *archiveFormat, *extractorArgs, tracker)
 		} else {
-			// Single URL download
-			url := urls[0]
-			downloader, createErr := NewDownloader(url, *workers, *chunkSize, *proxyURL, limitBytes, *verbose, *maxRetries, *retryDelay, memBytes)
-			if createErr != nil {
-				err = createErr
-			} else if sizeErr := downloader.getFileSize(); sizeErr != nil {
-				err = sizeErr
-			} else {
-				err = downloader.Download(ctx, p, *outputDir, *archiveFormat, *extractorArgs, tracker)
-			}
+			// Single URL download - reuse the downloader created earlier
+			err = singleDownloader.Download(ctx, p, *outputDir, *archiveFormat, *extractorArgs, tracker)
 		}
 
 		if err != nil {
