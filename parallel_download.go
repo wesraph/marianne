@@ -187,9 +187,40 @@ func (d *Downloader) downloadInOrderParallel(ctx context.Context, writer io.Writ
 		defer close(writerErr)
 
 		// Use a map to buffer out-of-order chunks
-		pendingChunks := make(map[int][]byte)
+		pendingChunks := make(map[int]chunkInfo)
 		nextExpectedChunk := 0
 		chunksWritten := 0
+
+		// Helper to send extracting status, write a chunk, then mark extracted
+		writeChunk := func(pending chunkInfo) error {
+			if len(pending.data) > 0 {
+				if p != nil {
+					p.Send(chunkProgressMsg{
+						chunkIndex: pending.index,
+						start:      pending.start,
+						end:        pending.end,
+						status:     "extracting",
+					})
+				}
+				n, err := writer.Write(pending.data)
+				if err != nil {
+					return fmt.Errorf("failed to write chunk %d: %w", pending.index, err)
+				}
+				if n != len(pending.data) {
+					return fmt.Errorf("short write on chunk %d: wrote %d bytes, expected %d", pending.index, n, len(pending.data))
+				}
+				d.downloaded.Add(int64(n))
+				if p != nil {
+					p.Send(chunkProgressMsg{
+						chunkIndex: pending.index,
+						start:      pending.start,
+						end:        pending.end,
+						status:     "extracted",
+					})
+				}
+			}
+			return nil
+		}
 
 		for chunksWritten < totalChunks {
 			select {
@@ -197,18 +228,10 @@ func (d *Downloader) downloadInOrderParallel(ctx context.Context, writer io.Writ
 				if !ok {
 					// Channel closed - write any remaining pending chunks in order
 					for chunksWritten < totalChunks {
-						if data, ok := pendingChunks[nextExpectedChunk]; ok {
-							if len(data) > 0 {
-								n, err := writer.Write(data)
-								if err != nil {
-									writerErr <- fmt.Errorf("failed to write chunk %d: %w", nextExpectedChunk, err)
-									return
-								}
-								if n != len(data) {
-									writerErr <- fmt.Errorf("short write on chunk %d: wrote %d bytes, expected %d", nextExpectedChunk, n, len(data))
-									return
-								}
-								d.downloaded.Add(int64(n))
+						if pending, ok := pendingChunks[nextExpectedChunk]; ok {
+							if err := writeChunk(pending); err != nil {
+								writerErr <- err
+								return
 							}
 							delete(pendingChunks, nextExpectedChunk)
 							nextExpectedChunk++
@@ -230,24 +253,15 @@ func (d *Downloader) downloadInOrderParallel(ctx context.Context, writer io.Writ
 				}
 
 				// Store chunk for sequential writing
-				pendingChunks[chunk.index] = chunk.data
+				pendingChunks[chunk.index] = chunk
 
 				// Write any consecutive chunks we can
 				for {
-					if data, ok := pendingChunks[nextExpectedChunk]; ok {
-						if len(data) > 0 {
-							n, err := writer.Write(data)
-							if err != nil {
-								innerCancel()
-								writerErr <- fmt.Errorf("failed to write chunk %d: %w", nextExpectedChunk, err)
-								return
-							}
-							if n != len(data) {
-								innerCancel()
-								writerErr <- fmt.Errorf("short write on chunk %d: wrote %d bytes, expected %d", nextExpectedChunk, n, len(data))
-								return
-							}
-							d.downloaded.Add(int64(n))
+					if pending, ok := pendingChunks[nextExpectedChunk]; ok {
+						if err := writeChunk(pending); err != nil {
+							innerCancel()
+							writerErr <- err
+							return
 						}
 						delete(pendingChunks, nextExpectedChunk)
 						nextExpectedChunk++

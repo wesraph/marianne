@@ -432,6 +432,16 @@ type model struct {
 	verbose        bool
 	chunkProgress  map[int]chunkProgressMsg
 
+	// Extraction tracking
+	extractionCount      int
+	extractionSpeed      float64 // files per second
+	lastExtCountSnap     int
+	lastExtSpeedTime     time.Time
+	extractionBytes      int64   // total bytes sent to extractor
+	extractionBytesSpeed float64 // bytes per second to extractor
+	lastExtBytes         int64
+	lastExtBytesTime     time.Time
+
 	// Multi-part fields
 	isMultiPart bool
 	currentPart int // 1-indexed for display
@@ -448,16 +458,18 @@ func initialModel(url string, totalSize int64, verbose bool, isMultiPart bool, t
 		PaddingRight(1)
 
 	return model{
-		url:           url,
-		progress:      prog,
-		viewport:      vp,
-		total:         totalSize,
-		startTime:     time.Now(),
-		verbose:       verbose,
-		chunkProgress: make(map[int]chunkProgressMsg),
-		isMultiPart:   isMultiPart,
-		totalParts:    totalParts,
-		currentPart:   1,
+		url:              url,
+		progress:         prog,
+		viewport:         vp,
+		total:            totalSize,
+		startTime:        time.Now(),
+		verbose:          verbose,
+		chunkProgress:    make(map[int]chunkProgressMsg),
+		lastExtSpeedTime: time.Now(),
+		lastExtBytesTime: time.Now(),
+		isMultiPart:      isMultiPart,
+		totalParts:       totalParts,
+		currentPart:      1,
 	}
 }
 
@@ -538,6 +550,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.SetContent(content)
 		m.viewport.GotoBottom()
 
+		// Track extraction speed
+		m.extractionCount++
+		if elapsed := time.Since(m.lastExtSpeedTime).Seconds(); elapsed > 0.5 {
+			delta := m.extractionCount - m.lastExtCountSnap
+			m.extractionSpeed = float64(delta) / elapsed
+			m.lastExtCountSnap = m.extractionCount
+			m.lastExtSpeedTime = time.Now()
+		}
+
 	case partProgressMsg:
 		m.currentPart = msg.partIndex + 1 // 1-indexed for display
 		m.url = msg.url
@@ -545,6 +566,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case chunkProgressMsg:
 		// Update chunk progress map (for speed calculation and display)
 		m.chunkProgress[msg.chunkIndex] = msg
+
+		// Track extraction throughput when a chunk finishes being sent to extractor
+		if msg.status == "extracted" {
+			chunkSize := msg.end - msg.start + 1
+			m.extractionBytes += chunkSize
+			if elapsed := time.Since(m.lastExtBytesTime).Seconds(); elapsed > 0.5 {
+				bytesDelta := m.extractionBytes - m.lastExtBytes
+				m.extractionBytesSpeed = float64(bytesDelta) / elapsed
+				m.lastExtBytes = m.extractionBytes
+				m.lastExtBytesTime = time.Now()
+			}
+		}
 
 		if m.verbose {
 			// Only add status changes to extracted files (not progress updates)
@@ -571,14 +604,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// Clean up completed/failed chunks from the map to prevent unbounded growth
+		// Clean up finished chunks from the map to prevent unbounded growth
 		// This runs in the TUI update loop so it's thread-safe
-		if msg.status == "completed" || msg.status == "failed" {
-			// Keep only the last 100 entries total (active + completed/failed)
+		if msg.status == "completed" || msg.status == "failed" || msg.status == "extracted" {
 			if len(m.chunkProgress) > 100 {
-				// Remove oldest completed/failed chunks (non-deterministic but acceptable)
 				for idx, chunk := range m.chunkProgress {
-					if (chunk.status == "completed" || chunk.status == "failed") && idx != msg.chunkIndex {
+					if (chunk.status == "completed" || chunk.status == "failed" || chunk.status == "extracted") && idx != msg.chunkIndex {
 						delete(m.chunkProgress, idx)
 						if len(m.chunkProgress) <= 100 {
 							break
@@ -655,6 +686,15 @@ func (m model) View() string {
 		formatBytes(int64(m.avgSpeed)),
 		formatDuration(m.eta),
 	)
+	if m.extractionBytesSpeed > 0 || m.extractionSpeed > 0 {
+		statsText += " | Extraction:"
+		if m.extractionBytesSpeed > 0 {
+			statsText += fmt.Sprintf(" %s/s", formatBytes(int64(m.extractionBytesSpeed)))
+		}
+		if m.extractionSpeed > 0 {
+			statsText += fmt.Sprintf(" (%.0f files/s)", m.extractionSpeed)
+		}
+	}
 
 	stats := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("241")).
@@ -665,6 +705,7 @@ func (m model) View() string {
 	const displayLimit = 10
 	chunkLines := make([]string, 0, displayLimit)
 	activeChunks := 0
+	extractingChunks := 0
 	completedChunks := 0
 	failedChunks := 0
 
@@ -676,7 +717,7 @@ func (m model) View() string {
 		}
 		sort.Ints(indices)
 
-		// Show only last 10 active chunks to avoid UI overflow
+		// Show only last 10 active/extracting chunks to avoid UI overflow
 		activeDisplayed := 0
 
 		for _, idx := range indices {
@@ -685,18 +726,16 @@ func (m model) View() string {
 			// Count chunk statuses
 			switch chunk.status {
 			case "started", "progress":
-				activeChunks++ // Count both started and in-progress chunks as active
-				// Only display active/in-progress chunks up to limit
+				activeChunks++
 				if activeDisplayed < displayLimit {
 					chunkSize := chunk.end - chunk.start + 1
 					elapsed := time.Since(chunk.startTime).Seconds()
 
-					// Display real-time download progress and speed
 					var progressInfo string
 					if chunk.bytesDownloaded > 0 {
-						progressPercent := float64(chunk.bytesDownloaded) / float64(chunkSize) * 100
+						chunkPercent := float64(chunk.bytesDownloaded) / float64(chunkSize) * 100
 						progressInfo = fmt.Sprintf("%.1f%% (%s/%s) @ %s/s",
-							progressPercent,
+							chunkPercent,
 							formatBytes(chunk.bytesDownloaded),
 							formatBytes(chunkSize),
 							formatBytes(int64(chunk.speed)))
@@ -714,7 +753,20 @@ func (m model) View() string {
 					))
 					activeDisplayed++
 				}
-			case "completed":
+			case "extracting":
+				extractingChunks++
+				if activeDisplayed < displayLimit {
+					chunkSize := chunk.end - chunk.start + 1
+					chunkLines = append(chunkLines, fmt.Sprintf(
+						"  #%-4d [%10s - %10s] Extracting (%s)...",
+						chunk.chunkIndex,
+						formatBytes(chunk.start),
+						formatBytes(chunk.end),
+						formatBytes(chunkSize),
+					))
+					activeDisplayed++
+				}
+			case "completed", "extracted":
 				completedChunks++
 			case "failed":
 				failedChunks++
@@ -728,12 +780,16 @@ func (m model) View() string {
 	}
 
 	// Build chunk summary header
-	chunkSummary := fmt.Sprintf("Chunks: %d active, %d completed", activeChunks, completedChunks)
+	chunkSummary := fmt.Sprintf("Chunks: %d active", activeChunks)
+	if extractingChunks > 0 {
+		chunkSummary += fmt.Sprintf(", %d extracting", extractingChunks)
+	}
+	chunkSummary += fmt.Sprintf(", %d completed", completedChunks)
 	if failedChunks > 0 {
 		chunkSummary += fmt.Sprintf(", %d failed", failedChunks)
 	}
-	if activeChunks > displayLimit {
-		chunkSummary += fmt.Sprintf(" (showing %d/%d active)", displayLimit, activeChunks)
+	if activeChunks+extractingChunks > displayLimit {
+		chunkSummary += fmt.Sprintf(" (showing %d/%d)", displayLimit, activeChunks+extractingChunks)
 	}
 
 	chunkHeader := lipgloss.NewStyle().
