@@ -42,12 +42,12 @@ func (d *Downloader) downloadInOrderParallel(ctx context.Context, writer io.Writ
 	}
 
 	// Calculate max chunks that can fit in memory
-	// Reserve some memory for other overhead
+	// Reserve some memory for other overhead (HTTP buffers, TLS, goroutine stacks)
 	usableMemory := int64(float64(memoryLimit) * memoryUsageFraction)
 	maxChunksInMemory := int(usableMemory / d.chunkSize)
-	if maxChunksInMemory < d.workers*2 {
-		// Ensure at least 2 chunks per worker
-		maxChunksInMemory = d.workers * 2
+	if maxChunksInMemory < 2 {
+		// Absolute minimum: need at least 2 chunks to make progress
+		maxChunksInMemory = 2
 	}
 	if maxChunksInMemory > maxChunksInMemoryCap {
 		// Cap to prevent excessive buffering
@@ -167,6 +167,7 @@ func (d *Downloader) downloadInOrderParallel(ctx context.Context, writer io.Writ
 					timer.Stop()
 					return
 				case <-timer.C:
+					timer.Stop()
 				}
 			}
 
@@ -266,14 +267,29 @@ func (d *Downloader) downloadInOrderParallel(ctx context.Context, writer io.Writ
 		writerErr <- nil
 	}()
 
-	// Wait for downloads to complete
+	// The writer goroutine is the primary consumer of resultChan.
+	// If it exits early (error), workers may block on resultChan send.
+	// Drain resultChan in background after writer exits so workers can finish.
+	var writeResult error
+	var drainWg sync.WaitGroup
+	drainWg.Add(1)
+	go func() {
+		defer drainWg.Done()
+		writeResult = <-writerErr
+		// Drain any remaining results so workers can unblock and exit
+		for range resultChan {
+		}
+	}()
+
+	// Wait for all workers to finish, then close resultChan so drainer exits
 	downloadWg.Wait()
 	close(resultChan)
 
-	// Wait for writer to complete
-	err := <-writerErr
-	if err != nil {
-		return err
+	// Wait for drainer to finish
+	drainWg.Wait()
+
+	if writeResult != nil {
+		return writeResult
 	}
 
 	// Verify total bytes written matches expected size
