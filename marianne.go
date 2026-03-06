@@ -49,6 +49,14 @@ const (
 var (
 	// Version is set at build time
 	Version = "dev"
+
+	// readBufPool reuses read buffers across chunk downloads to reduce allocations
+	readBufPool = sync.Pool{
+		New: func() any {
+			buf := make([]byte, chunkReadBufferSize)
+			return &buf
+		},
+	}
 )
 
 type Downloader struct {
@@ -87,9 +95,15 @@ func NewDownloader(url string, workers int, chunkSize int64, proxyURL string, ba
 		maxRetries = defaultMaxRetries // Use default retries
 	}
 
+	// Size connection pool to match worker count to avoid excessive idle memory
+	poolSize := workers * 2
+	if poolSize < 16 {
+		poolSize = 16
+	}
+
 	transport := &http.Transport{
-		MaxIdleConns:        1000,
-		MaxIdleConnsPerHost: 1000,
+		MaxIdleConns:        poolSize,
+		MaxIdleConnsPerHost: poolSize,
 		MaxConnsPerHost:     0, // No limit
 		IdleConnTimeout:     90 * time.Second,
 		DisableCompression:  true, // We're downloading binary files
@@ -289,7 +303,10 @@ func (d *Downloader) downloadChunkWithProgress(ctx context.Context, start, end i
 			return fmt.Errorf("Content-Range mismatch: requested bytes %d-%d but got bytes %d-%d", start, end, rangeStart, rangeEnd)
 		}
 
-		buf := make([]byte, chunkReadBufferSize) // Buffer to reduce memory usage
+		bufPtr := readBufPool.Get().(*[]byte)
+		buf := *bufPtr
+		clear(buf)
+		defer readBufPool.Put(bufPtr)
 		var totalRead int64
 		lastProgressTime := time.Now()
 
@@ -1623,6 +1640,12 @@ func (d *Downloader) extractZipFile(filename string, outputDir string, p *tea.Pr
 	}
 	defer reader.Close()
 
+	// Resolve output directory once outside the loop
+	absOutputDir, err := filepath.Abs(outputDir)
+	if err != nil {
+		return fmt.Errorf("failed to resolve output dir: %w", err)
+	}
+
 	// Extract files
 	for _, file := range reader.File {
 		// Validate file path to prevent path traversal attacks
@@ -1636,10 +1659,6 @@ func (d *Downloader) extractZipFile(filename string, outputDir string, p *tea.Pr
 		absPath, err := filepath.Abs(path)
 		if err != nil {
 			return fmt.Errorf("failed to resolve path: %w", err)
-		}
-		absOutputDir, err := filepath.Abs(outputDir)
-		if err != nil {
-			return fmt.Errorf("failed to resolve output dir: %w", err)
 		}
 		// Use filepath.Rel to check if path is within output directory
 		relPath, err := filepath.Rel(absOutputDir, absPath)
@@ -1659,7 +1678,7 @@ func (d *Downloader) extractZipFile(filename string, outputDir string, p *tea.Pr
 			if err != nil {
 				return fmt.Errorf("failed to read symlink %s: %w", file.Name, err)
 			}
-			linkTarget, err := io.ReadAll(fileReader)
+			linkTarget, err := io.ReadAll(io.LimitReader(fileReader, 4096))
 			fileReader.Close()
 			if err != nil {
 				return fmt.Errorf("failed to read symlink target for %s: %w", file.Name, err)
@@ -1960,10 +1979,10 @@ func main() {
 
 	if isMultiPart {
 		// Multi-part download path
-		// Create HTTP client for validation
+		// Create HTTP client for validation (small pool, only used for HEAD requests)
 		transport := &http.Transport{
-			MaxIdleConns:        1000,
-			MaxIdleConnsPerHost: 1000,
+			MaxIdleConns:        16,
+			MaxIdleConnsPerHost: 16,
 			MaxConnsPerHost:     0,
 			IdleConnTimeout:     90 * time.Second,
 			DisableCompression:  true,
